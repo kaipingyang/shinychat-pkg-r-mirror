@@ -1,0 +1,1079 @@
+#' Open a live chat application in the browser
+#'
+#' @description
+#' Create a simple Shiny app for live chatting using an [ellmer::Chat] object.
+#' Note that these functions will mutate the input `client` object as
+#' you chat because your turns will be appended to the history.
+#'
+#' The app created by `chat_app()` is suitable for interactive use by a single
+#' user. For multi-user Shiny apps, use [chat_ui()] and `chat_server()` and be
+#' sure to create a new chat client for each user session.
+#'
+#' @section Migration:
+#' `...` now configures [page_chat()] instead of [shiny::shinyApp()]. Pass
+#' Shiny app options through `app_options`, and use `bookmark_store` instead of
+#' `enableBookmarking`. To customize `onStart` or `uiPattern`, compose
+#' [page_chat()] and [chat_server()] manually.
+#'
+#' This is a breaking change: `...` no longer accepts arguments for
+#' [shiny::shinyApp()], including `options`, `enableBookmarking`, `onStart`,
+#' and `uiPattern`.
+#'
+#' @examples
+#' \dontrun{
+#' # Interactive in the console ----
+#' client <- ellmer::chat_anthropic()
+#' chat_app(client)
+#'
+#' # Inside a Shiny app ----
+#' library(shiny)
+#' library(bslib)
+#' library(shinychat)
+#'
+#' ui <- page_fillable(
+#'   titlePanel("shinychat example"),
+#'
+#'   layout_columns(
+#'     card(
+#'       card_header("Chat with Claude"),
+#'       chat_ui(
+#'         "claude",
+#'         greeting = "Hi! Use this chat interface to chat with Anthropic's `claude-3-5-sonnet`."
+#'       )
+#'     ),
+#'     card(
+#'       card_header("Chat with ChatGPT"),
+#'       chat_ui(
+#'         "openai",
+#'         greeting = "Hi! Use this chat interface to chat with OpenAI's `gpt-4o`."
+#'       )
+#'     )
+#'   )
+#' )
+#'
+#' server <- function(input, output, session) {
+#'   claude <- ellmer::chat_anthropic(model = "claude-3-5-sonnet-latest") # Requires ANTHROPIC_API_KEY
+#'   openai <- ellmer::chat_openai(model = "gpt-4o") # Requires OPENAI_API_KEY
+#'
+#'   chat_server("claude", claude)
+#'   chat_server("openai", openai)
+#' }
+#'
+#' shinyApp(ui, server)
+#' }
+#'
+#' @param client A chat object created by \pkg{ellmer}, e.g.
+#'   [ellmer::chat_openai()] and friends.
+#' @param ... Named arguments passed to [page_chat()].
+#' @param title The title displayed in the page header. If `NULL` (the
+#'   default), a `"{model} ({provider})"` title is derived from `client`.
+#' @param icon Optional UI displayed before `title`. See [page_chat()].
+#' @param window_title The browser-window title. If `NULL` (the default),
+#'   uses `"shinychat | {model} | {date}"` derived from `client`.
+#' @param id The ID shared by [page_chat()] and [chat_server()].
+#' @param greeting See [chat_server()].
+#' @param history See [chat_server()].
+#' @param bookmark_store The bookmarking store to use for the app. Passed to
+#'   `enableBookmarking` in [shiny::shinyApp()]. Defaults to `"url"`, which
+#'   uses the URL to store the chat state. URL-based bookmarking is limited in
+#'   size; use `"server"` to store the state on the server side without size
+#'   limitations; or disable bookmarking by setting this to `"disable"`.
+#' @param app_options A list passed to the `options` argument of
+#'   [shiny::shinyApp()].
+#'
+#' @returns
+#'   * `chat_app()` returns a [shiny::shinyApp()] object.
+#'   * `chat_server()` includes the shinychat server logic, and
+#'     returns an environment containing:
+#'
+#'     * `last_input`: A reactive value containing the last user input (a string
+#'       when attachments are disabled, a list of ellmer `Content` objects when
+#'       enabled).
+#'     * `last_turn`: A reactive value containing the last assistant turn.
+#'     * `update_user_input()`: A function to update the chat input or submit a
+#'       new user input. Takes the same arguments as [update_chat_user_input()],
+#'       except for `id` and `session`, which are supplied automatically.
+#'     * `append()`: A function to append a new message to the chat UI. Takes
+#'       the same arguments as [chat_append()], except for `id` and `session`,
+#'       which are supplied automatically.
+#'     * `clear()`: A function to clear the chat client turns and the chat UI.
+#'       It optionally takes a list of `messages` used to initialize the chat
+#'       after clearing. `messages` should be a list of messages, where each
+#'       message is a list with `role` and `content` fields. The
+#'       `client_history` argument controls how the chat client's history is
+#'       updated after clearing. It can be one of: `"clear"` the chat history;
+#'       `"set"` the chat history to `messages`; `"append"` `messages` to the
+#'       existing chat history; or `"keep"` the existing chat history.
+#'       `clear()` is unavailable when conversation history is enabled; use
+#'       `new_chat()` instead.
+#'     * `new_chat()`: A function to save the current conversation and start a
+#'       new one by clearing the chat client's turns and chat UI, resetting the
+#'       active conversation, and updating the history drawer. It is available
+#'       only when conversation history is enabled. `new_chat(greeting = TRUE)`
+#'       also clears the greeting and requests a new one. `new_chat()` errors
+#'       while a response is streaming; wait for it to complete or stop it
+#'       first.
+#'     * `set_greeting()`: A function to set, stream, or clear the chat
+#'       greeting. Pass a [chat_greeting()] object, a plain string, or
+#'       `NULL` to clear. Streaming greetings run inside an
+#'       [shiny::ExtendedTask] so the session stays responsive; if called
+#'       while a greeting is already streaming, the new greeting is queued.
+#'       If the greeting has already been dismissed, calling `set_greeting()`
+#'       updates the content but does not make it visible again; call
+#'       `clear(greeting = TRUE)` first to show a new greeting after dismissal.
+#'     * `status`: A reactive value indicating the current chat interaction
+#'       state. Returns `"idle"` when no response is in progress, or
+#'       `"streaming"` while a response is actively being received.
+#'     * `history`: A namespace for managing conversation-history callbacks and
+#'       persistence. `saved <- chat_module$history$save()` saves only the
+#'       existing active conversation and returns whether it was saved. Storage
+#'       and bookmark errors propagate to the caller.
+#'     * `last_error`: A reactive value holding the condition from the most
+#'       recent response if it failed, and `NULL` otherwise. Both a finished
+#'       and a failed response read as `"idle"` in `status`, so this is what
+#'       tells them apart. Responses only: a greeting streams from its own
+#'       task, and an error raised by a slash command handler is reported as
+#'       a notification, so neither appears here.
+#'     * `client`: The current chat client object (an active binding that
+#'       always reflects the latest client, even after `set_client()`
+#'       is called).
+#'     * `history$conversation_id()`: A reactive expression returning the
+#'       active conversation ID: `NULL` when history is disabled or the chat
+#'       is still an empty draft, otherwise the ID allocated on the first
+#'       user submission -- before the model call -- that the saved
+#'       conversation record carries. The ID is stable across retries,
+#'       restores, conversation switches, and `set_client()` calls. The ID
+#'       is also handed to the client (via its `conversation_id` binding,
+#'       when supported), which records it as the `gen_ai.conversation.id`
+#'       attribute on its own OpenTelemetry spans.
+#'     * `set_client(new_client, sync = TRUE)`: Replace the chat client used by
+#'       the module. When `sync` is `TRUE` (the default), the new client
+#'       inherits conversation turns, system prompt, and tools from the previous
+#'       client so the conversation continues seamlessly. Set `sync = FALSE` to
+#'       use the new client as-is. If a response is currently streaming, the
+#'       swap is deferred until the stream completes. If called multiple times
+#'       while streaming, only the most recent new client is used.
+#'     * `slash_command(name, description, handler, ..., echo, force)`: Register
+#'       a slash command. `handler` is required: pass a function (taking 0 or 1
+#'       argument), or `NULL` for a client-side command handled in JavaScript via
+#'       the `shiny:chat-slash-command` DOM event. A handler that takes one
+#'       argument receives a [ContentSlashCommand] object (not a plain string).
+#'       See [ContentSlashCommand] for details on how to use this object to
+#'       preserve the original command text across bookmarks. `echo` controls
+#'       whether invoking the command is echoed as a user message and awaits a
+#'       response; it defaults to `TRUE` when a handler is given and `FALSE`
+#'       otherwise (set `echo = FALSE` for a handler that only performs side
+#'       effects). Returns a function that removes the command. Errors if a
+#'       command with the same name is already registered unless
+#'       `force = TRUE`.
+#'
+#' @describeIn chat_app A simple Shiny app for live chatting. Note that this
+#'   app is suitable for interactive use by a single user; do not use
+#'   `chat_app()` in a multi-user Shiny app context.
+#' @export
+chat_app <- function(
+  client,
+  ...,
+  title = NULL,
+  icon = NULL,
+  window_title = NULL,
+  id = "chat",
+  greeting = NULL,
+  history = TRUE,
+  bookmark_store = "url",
+  app_options = list()
+) {
+  check_ellmer_chat(client)
+  dots <- rlang::dots_list(...)
+  check_chat_app_dots(dots)
+  if (!isFALSE(history) && !is.null(dots$messages)) {
+    cli::cli_abort(c(
+      "{.code chat_app(messages = ...)} requires {.code history = FALSE}: startup messages can't be recorded by the conversation-history feature.",
+      "Use the {.arg greeting} argument for a startup message, or set {.code history = FALSE} if you're managing conversation state yourself."
+    ))
+  }
+  if (isFALSE(history) && !"sidebar" %in% rlang::names2(dots)) {
+    dots$sidebar <- FALSE
+  }
+
+  if (!is.list(app_options)) {
+    cli::cli_abort("{.arg app_options} must be a list.")
+  }
+
+  client_info <- NULL
+  if (is.null(title) || is.null(window_title)) {
+    client_info <- get_client_info(client)
+  }
+  if (is.null(title)) {
+    title <- paste0(client_info$model, " (", client_info$provider, ")")
+  }
+  if (is.null(window_title)) {
+    window_title <- paste(
+      "shinychat",
+      client_info$model,
+      format(Sys.Date(), "%Y-%m-%d"),
+      sep = " | "
+    )
+  }
+
+  is_interactive <- rlang::is_interactive()
+  close_id <- paste0(id, "-close-btn")
+  if (is_interactive) {
+    stop_toolbar <- chat_app_stop_button(close_id)
+    if ("toolbar_global" %in% rlang::names2(dots)) {
+      dots$toolbar_global <- htmltools::tagList(
+        dots$toolbar_global,
+        bslib::toolbar(stop_toolbar)
+      )
+    } else {
+      dots$toolbar_global <- bslib::toolbar(
+        bslib::input_dark_mode(),
+        stop_toolbar
+      )
+    }
+  }
+
+  ui <- function(req) {
+    rlang::exec(
+      page_chat,
+      title = title,
+      icon = icon,
+      !!!dots,
+      id = id,
+      window_title = window_title
+    )
+  }
+
+  server <- function(input, output, session) {
+    if (is_interactive) {
+      shiny::setBookmarkExclude(close_id)
+      shiny::observeEvent(input[[close_id]], label = "on_close_btn", {
+        shiny::stopApp()
+      })
+    }
+    chat_server(id, client, greeting = greeting, history = history)
+  }
+
+  shiny::shinyApp(
+    ui,
+    server,
+    options = app_options,
+    enableBookmarking = bookmark_store
+  )
+}
+
+chat_app_stop_button <- function(id) {
+  bslib::toolbar_input_button(
+    id = id,
+    label = "Stop chat app",
+    icon = htmltools::HTML(
+      '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-stop-circle-fill text-danger" viewBox="0 0 16 16"><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0M6.5 5A1.5 1.5 0 0 0 5 6.5v3A1.5 1.5 0 0 0 6.5 11h3A1.5 1.5 0 0 0 11 9.5v-3A1.5 1.5 0 0 0 9.5 5z"/></svg>'
+    ),
+    show_label = FALSE,
+    tooltip = "Stop chat app"
+  )
+}
+
+check_chat_app_dots <- function(dots) {
+  dot_names <- rlang::names2(dots)
+  shiny_app_args <- names(formals(shiny::shinyApp))
+  legacy_args <- intersect(dot_names, shiny_app_args)
+  if (length(legacy_args) == 0) {
+    return(invisible())
+  }
+
+  migration <- c(
+    options = "Pass this list with {.arg app_options}.",
+    enableBookmarking = "Use {.arg bookmark_store}.",
+    onStart = "Compose {.fn page_chat} and {.fn chat_server} manually to customize app startup.",
+    uiPattern = "Compose {.fn page_chat} and {.fn chat_server} manually to customize the app route.",
+    ui = "{.fn chat_app} owns the app UI; compose {.fn page_chat} and {.fn chat_server} manually instead.",
+    server = "{.fn chat_app} owns the app server; compose {.fn page_chat} and {.fn chat_server} manually instead."
+  )
+
+  cli::cli_abort(
+    c(
+      "{.fn chat_app} no longer passes {.arg ...} to {.fn shiny::shinyApp}.",
+      stats::setNames(migration[legacy_args], rep("i", length(legacy_args)))
+    ),
+    call = rlang::caller_env()
+  )
+}
+
+check_ellmer_chat <- function(client) {
+  if (!inherits(client, "Chat")) {
+    abort("`client` must be an `ellmer::Chat` object.")
+  }
+}
+
+# shinychat emits no OpenTelemetry spans itself; the client records the ID
+# as `gen_ai.conversation.id` on its own spans. Clients without the
+# `conversation_id` binding (older ellmer) are left alone.
+# TODO: replace the capability check with an ellmer version floor once the
+# binding is in a released ellmer version.
+set_client_conversation_id <- function(client, id) {
+  if ("conversation_id" %in% names(client)) {
+    client$conversation_id <- id
+  }
+  invisible()
+}
+
+#' Deprecated chat module functions
+#'
+#' @description
+#' `r lifecycle::badge("deprecated")`
+#'
+#' These functions are deprecated as of shinychat 0.5.0. Use [chat_ui()] and
+#' [chat_server()] instead, pairing them by `id` as described in *Pairing with
+#' `chat_server()`* in [chat_ui()].
+#'
+#' @param id The chat module ID.
+#' @param client Deprecated. The client state is now managed by [chat_server()].
+#' @param messages Initial messages shown in the chat, used only when `client`
+#'   doesn't already contain turns. Passed to `messages` in [chat_ui()].
+#' @param greeting See [chat_server()].
+#' @param bookmark_on_input See [chat_server()].
+#' @param bookmark_on_response See [chat_server()].
+#' @inheritParams chat_ui
+#' @returns
+#'   * `chat_mod_ui()` returns the UI for a shinychat module.
+#'   * `chat_mod_server()` returns the value of [chat_server()].
+#' @keywords internal
+#' @export
+chat_mod_ui <- function(
+  id,
+  ...,
+  client = deprecated(),
+  messages = NULL,
+  allow_attachments = TRUE
+) {
+  lifecycle::deprecate_soft(
+    "0.5.0",
+    "chat_mod_ui()",
+    details = "Use `chat_ui(NS(id, \"chat\"), ...)` in your module UI instead."
+  )
+
+  if (lifecycle::is_present(client)) {
+    lifecycle::deprecate_warn(
+      "0.3.0",
+      "chat_mod_ui(client = )",
+      "chat_server(client = )"
+    )
+  }
+
+  chat_ui(
+    shiny::NS(id, "chat"),
+    messages = messages,
+    enable_cancel = TRUE,
+    `effective-id` = id,
+    allow_attachments = allow_attachments,
+    ...
+  )
+}
+
+#' @describeIn chat_app Wire up batteries-included chat server logic in a Shiny
+#'   session. Pair with [chat_ui()] by passing it the same `id`; see *Pairing
+#'   with `chat_server()`* in [chat_ui()] for the top-level and module-based
+#'   patterns.
+#' @inheritParams chat_restore
+#' @param history Conversation history configuration. `TRUE` (default) enables
+#'   history with default settings; `FALSE` disables it; pass a [history_options()]
+#'   object to customise storage, identity, titling, or hooks.
+#' @param session The Shiny session. Defaults to the current reactive domain.
+#' @param greeting Optional greeting to set when the module initializes.
+#'   Accepts a static value (string, [htmltools::HTML()], [htmltools::tagList()],
+#'   or [chat_greeting()]) or a **function** that generates the greeting
+#'   dynamically. See the **Greeting** section below for details.
+#'
+#' @section Greeting:
+#'
+#' When `greeting` is a **function**, it is called each time the
+#' `greeting_requested` event fires — on first view when the chat is empty,
+#' and again after `clear(greeting = TRUE)`. The function should return a
+#' [chat_greeting()] (typically wrapping a stream). Static values (strings,
+#' [chat_greeting()] objects) are set once at init and do not regenerate.
+#'
+#' The function signature determines what is passed. Currently the only
+#' recognized argument is `client`.
+#'
+#' **`function(client)`** (recommended). A clone of the `client` with its turn
+#' history wiped is passed as `client`. This avoids manually creating and
+#' configuring a separate client:
+#'
+#' ```r
+#' chat_server("chat", client, greeting = function(client) {
+#'   stream <- client$stream_async("Generate a short welcome message.")
+#'   chat_greeting(stream)
+#' })
+#' ```
+#'
+#' **`function()`** (zero arguments). You create and manage your own client:
+#'
+#' ```r
+#' chat_server("chat", client, greeting = function() {
+#'   greeter <- ellmer::chat_openai(model = "gpt-4o")
+#'   stream <- greeter$stream_async("Generate a short welcome message.")
+#'   chat_greeting(stream)
+#' })
+#' ```
+#'
+#' **Static value.** Set once; does not regenerate after `clear()`:
+#'
+#' ```r
+#' chat_server("chat", client, greeting = "## Welcome!\n\nHow can I help?")
+#' ```
+#'
+#' The returned `set_greeting()` helper is available for cases where you need
+#' to set a greeting outside the greeting lifecycle.
+#'
+#' @importFrom shiny isolate
+#' @export
+chat_server <- function(
+  id,
+  client,
+  greeting = NULL,
+  history = TRUE,
+  bookmark_on_input = lifecycle::deprecated(),
+  bookmark_on_response = lifecycle::deprecated(),
+  session = shiny::getDefaultReactiveDomain()
+) {
+  check_ellmer_chat(client)
+
+  bm_on_input <- FALSE
+  bm_on_response <- FALSE
+  if (lifecycle::is_present(bookmark_on_input)) {
+    lifecycle::deprecate_warn(
+      "0.5.0",
+      "chat_server(bookmark_on_input = )",
+      details = "Chat history now handles persistence. Use `history = TRUE` (the default)."
+    )
+    bm_on_input <- isTRUE(bookmark_on_input)
+  }
+  if (lifecycle::is_present(bookmark_on_response)) {
+    lifecycle::deprecate_warn(
+      "0.5.0",
+      "chat_server(bookmark_on_response = )",
+      details = "Chat history now handles persistence. Use `history = TRUE` (the default)."
+    )
+    bm_on_response <- isTRUE(bookmark_on_response)
+  }
+
+  append_stream_task <- shiny::ExtendedTask$new(
+    function(client, ui_id, user_input, controller = NULL) {
+      stream <- client$stream_async(
+        !!!user_input,
+        stream = "content",
+        controller = controller
+      )
+
+      p <- promises::promise_resolve(stream)
+      promises::then(p, function(stream) {
+        chat_append(ui_id, stream)
+      })
+    }
+  )
+
+  greeting_stream_task <- shiny::ExtendedTask$new(
+    function(ui_id, greeting, session) {
+      result <- chat_set_greeting(ui_id, greeting, session = session)
+      if (is.null(result)) {
+        promises::promise_resolve(NULL)
+      } else {
+        result
+      }
+    }
+  )
+
+  saved_on_save_fns <- list()
+  saved_on_restore_fns <- list()
+
+  # `history` (chat_enable_history()) and `chat_restore()` are mutually
+  # exclusive: history_options(restore_mode = "bookmark") is the modern,
+  # per-conversation replacement for chat_restore()'s whole-session Shiny
+  # bookmark. chat_restore() is kept only for apps built before history
+  # existed, or that don't need multi-conversation history at all.
+  cancel_history <- if (!isFALSE(history)) {
+    config <- if (isTRUE(history)) history_options() else history
+    chat_enable_history(id, client, options = config, session = session)
+  } else if (bm_on_input || bm_on_response) {
+    chat_restore(
+      id,
+      client,
+      bookmark_on_input = bm_on_input,
+      bookmark_on_response = bm_on_response,
+      session = session
+    )
+  } else {
+    NULL
+  }
+
+  # Reactive reference to the live history controller, so the public
+  # `history$conversation_id()` reactive stays stable across the controller
+  # replacement that set_client() performs.
+  history_controller <- shiny::reactiveVal(NULL, label = "history_controller")
+  if (!isFALSE(history)) {
+    history_controller(get_session_chat_bookmark_info(
+      session,
+      paste0(id, ".history-controller")
+    ))
+  }
+
+  last_turn <- shiny::reactiveVal(NULL, label = "last_turn")
+  last_input <- shiny::reactiveVal(NULL, label = "last_input")
+  pending_swap <- shiny::reactiveVal(NULL, label = "pending_swap")
+  ctrl <- ellmer::stream_controller()
+
+  swap_client <- function(new_client, sync) {
+    if (sync) {
+      new_client$set_turns(client$get_turns())
+      new_client$set_system_prompt(client$get_system_prompt())
+      new_client$set_tools(client$get_tools())
+    }
+    client <<- new_client
+
+    config <- if (isTRUE(history)) history_options() else history
+
+    # Preserve the active conversation across the controller replacement.
+    # A completed response has already created a record, while an in-progress
+    # draft has only an allocated ID.
+    old_ctrl <- get_session_chat_bookmark_info(
+      session,
+      paste0(id, ".history-controller")
+    )
+    active_record <- if (!is.null(old_ctrl)) old_ctrl$record else NULL
+    active_id <- if (!is.null(old_ctrl) && is.null(active_record)) {
+      shiny::isolate(old_ctrl$conversation_id())
+    } else {
+      NULL
+    }
+
+    if (!is.null(cancel_history)) {
+      cancel_history()
+    }
+
+    cancel_history <<- if (!isFALSE(history)) {
+      chat_enable_history(
+        id,
+        client,
+        options = config,
+        restore_ui = FALSE,
+        session = session
+      )
+    } else if (bm_on_input || bm_on_response) {
+      chat_restore(
+        id,
+        client,
+        bookmark_on_input = bm_on_input,
+        bookmark_on_response = bm_on_response,
+        restore_ui = FALSE,
+        session = session
+      )
+    } else {
+      NULL
+    }
+
+    new_ctrl <- get_session_chat_bookmark_info(
+      session,
+      paste0(id, ".history-controller")
+    )
+    history_controller(new_ctrl)
+    if (!is.null(new_ctrl)) {
+      if (
+        !is.null(active_record) &&
+          !identical(config$restore_mode, "none")
+      ) {
+        new_ctrl$activate_record(active_record)
+      } else if (!is.null(active_id)) {
+        new_ctrl$seed_conversation_id(active_id)
+      }
+      for (fn in saved_on_save_fns) {
+        new_ctrl$add_save_callback(fn)
+      }
+      for (fn in saved_on_restore_fns) {
+        new_ctrl$add_restore_callback(fn)
+      }
+    }
+    invisible()
+  }
+
+  set_client <- function(new_client, sync = TRUE) {
+    check_ellmer_chat(new_client)
+
+    if (append_stream_task$status() == "running") {
+      pending_swap(list(client = new_client, sync = sync))
+      return(invisible())
+    }
+
+    swap_client(new_client, sync)
+  }
+
+  shiny::observeEvent(
+    session$input[[paste0(id, "_user_input")]],
+    label = "on_chat_user_input",
+    {
+      user_input <- session$input[[paste0(id, "_user_input")]]
+      last_input(user_input)
+
+      # Resolve the active conversation ID before model work begins and set
+      # it on the client as a scalar: later history switches, new-chat
+      # actions, or client swaps must not relabel in-flight work. Assumes
+      # one active stream per client; overlapping submissions could
+      # cross-label spans.
+      hist_ctrl <- history_controller()
+      if (!is.null(hist_ctrl)) {
+        # Match Python: surface failures (e.g. url-mode send_navigate)
+        # through the standard error path instead of escaping the observer.
+        tryCatch(
+          set_client_conversation_id(
+            client,
+            hist_ctrl$ensure_conversation_id()
+          ),
+          error = function(e) {
+            shiny::showNotification(
+              sanitized_error_message(e),
+              type = "error",
+              duration = NULL
+            )
+            rlang::warn(
+              "Error resolving the active conversation ID",
+              parent = e
+            )
+          }
+        )
+      }
+
+      append_stream_task$invoke(
+        client,
+        id,
+        user_input,
+        controller = ctrl
+      )
+    }
+  )
+
+  shiny::observeEvent(
+    session$input[[paste0(id, "_cancel")]],
+    label = "on_chat_cancel",
+    {
+      ctrl$cancel()
+    }
+  )
+
+  shiny::observe(label = "on_stream_complete", {
+    status <- append_stream_task$status()
+    swap <- pending_swap()
+
+    if (status == "success") {
+      last_turn(client$last_turn())
+    }
+
+    if (!is.null(swap) && status != "running") {
+      pending_swap(NULL)
+      swap_client(swap$client, swap$sync)
+    }
+  })
+
+  chat_update_user_input <- function(
+    value = NULL,
+    ...,
+    placeholder = NULL,
+    submit = FALSE,
+    focus = FALSE,
+    attachments = NULL,
+    attachment_mode = c("append", "set")
+  ) {
+    update_chat_user_input(
+      id,
+      value = value,
+      placeholder = placeholder,
+      submit = submit,
+      focus = focus,
+      attachments = attachments,
+      attachment_mode = attachment_mode,
+      ...,
+      session = session
+    )
+  }
+
+  chat_append_mod <- function(response, role = "assistant", icon = NULL) {
+    chat_append(id, response, role = role, icon = icon, session = session)
+  }
+
+  set_greeting_mod <- function(greeting) {
+    greeting_stream_task$invoke(id, greeting, session)
+  }
+
+  resolve_greeting_mod <- function() {
+    if (is.function(greeting)) {
+      greeting_fmls <- names(formals(greeting))
+      args <- list()
+      if ("client" %in% greeting_fmls) {
+        greeter <- client$clone()
+        greeter$set_turns(list())
+        args$client <- greeter
+      }
+      greeting_stream_task$invoke(id, do.call(greeting, args), session)
+    } else {
+      set_greeting_mod(greeting)
+    }
+  }
+
+  if (!is.null(greeting)) {
+    history_enabled <- !isFALSE(history)
+    # NB: not `history_controller` -- that name is the reactiveVal above
+    # tracking the live controller, and a plain assignment here would
+    # clobber it in this scope.
+    hist_ctrl <- if (history_enabled) {
+      get_session_chat_bookmark_info(
+        session,
+        paste0(id, ".history-controller")
+      )
+    } else {
+      NULL
+    }
+
+    if (!is.null(hist_ctrl)) {
+      # Defer to history's own restore-decision instead of racing the
+      # client's independent `_greeting_requested` request.
+      hist_ctrl$on_settled <- function(restored) {
+        if (!restored) {
+          resolve_greeting_mod()
+        }
+      }
+    } else if (is.function(greeting)) {
+      shiny::observeEvent(
+        session$input[[paste0(id, "_greeting_requested")]],
+        label = "on_greeting_requested",
+        {
+          resolve_greeting_mod()
+        }
+      )
+    } else {
+      resolve_greeting_mod()
+    }
+  }
+
+  send_chat_action(
+    id,
+    list(type = "update_cancel", enable_cancel = TRUE),
+    session = session
+  )
+  send_chat_action(
+    id,
+    list(type = "update_upload", enable_upload = TRUE),
+    session = session
+  )
+
+  # Registered slash commands. Each entry: list(handler, takes_args, definition).
+  # Using a reactiveVal lets multiple registrations during app startup coalesce
+  # into a single client sync on the next flush. Starts as NULL so the sync
+  # observer skips the redundant initial send (the client already initializes
+  # to []); an empty list is sent when the last command is removed.
+  slash_commands <- shiny::reactiveVal(NULL, label = "slash_commands")
+
+  shiny::observeEvent(
+    session$input[[paste0(id, "_slash_command")]],
+    label = "on_chat_slash_command",
+    {
+      data <- session$input[[paste0(id, "_slash_command")]]
+      reg <- isolate(slash_commands())[[data$command]]
+      if (!is.null(reg) && is.function(reg$handler)) {
+        tryCatch(
+          {
+            if (isTRUE(reg$takes_args)) {
+              user_text <- data$userText %||% ""
+              content <- ContentSlashCommand(
+                command = data$command,
+                user_text = user_text,
+                text = paste0(
+                  sprintf(
+                    "The user entered the /%s slash command",
+                    data$command
+                  ),
+                  if (nzchar(user_text)) {
+                    paste0(" with arguments: ", user_text)
+                  } else {
+                    "."
+                  }
+                )
+              )
+              reg$handler(content)
+            } else {
+              reg$handler()
+            }
+          },
+          error = function(e) {
+            shiny::showNotification(
+              sanitized_error_message(e),
+              type = "error",
+              duration = NULL
+            )
+            rlang::warn(
+              sprintf("Error in slash command '/%s'", data$command),
+              parent = e
+            )
+          }
+        )
+      }
+      send_chat_action(
+        id,
+        list(type = "remove_loading"),
+        session = session
+      )
+    }
+  )
+
+  shiny::observe(label = "sync_slash_commands", {
+    cmds <- slash_commands()
+    if (!is.null(cmds)) {
+      defs <- lapply(cmds, `[[`, "definition")
+      send_chat_action(
+        id,
+        list(type = "update_slash_commands", commands = unname(defs)),
+        session = session
+      )
+    }
+  })
+
+  # TODO: Support a standalone register_slash_command() that works outside the
+  # returned environment (e.g., so callers don't have to thread the return value)
+  slash_command_method <- function(
+    name,
+    description,
+    handler,
+    ...,
+    echo = NULL,
+    force = FALSE
+  ) {
+    rlang::check_dots_empty()
+    if (!is.character(name) || length(name) != 1) {
+      cli::cli_abort("{.arg name} must be a single string.")
+    }
+    if (!grepl("^[a-zA-Z0-9_-]+$", name)) {
+      cli::cli_abort(
+        "{.arg name} must contain only alphanumeric characters, underscores, or hyphens, got {.val {name}}."
+      )
+    }
+    if (!is.character(description) || length(description) != 1) {
+      cli::cli_abort("{.arg description} must be a single string.")
+    }
+    if (!is.null(handler) && !is.function(handler)) {
+      cli::cli_abort("{.arg handler} must be a function or {.code NULL}.")
+    }
+
+    takes_args <- FALSE
+    if (is.function(handler)) {
+      handler_args <- names(formals(handler))
+      if (length(handler_args) > 1 || identical(handler_args, "...")) {
+        cli::cli_abort("{.arg handler} must take 0 or 1 argument.")
+      }
+      takes_args <- length(handler_args) > 0
+    }
+
+    cmds <- isolate(slash_commands()) %||% list()
+
+    if (!force && name %in% names(cmds)) {
+      cli::cli_abort(
+        "Slash command {.val {name}} is already registered. Use {.code force = TRUE} to overwrite it."
+      )
+    }
+
+    resolved_echo <- if (is.null(echo)) !is.null(handler) else isTRUE(echo)
+
+    cmds[[name]] <- list(
+      handler = handler,
+      takes_args = takes_args,
+      definition = list(
+        name = name,
+        description = description,
+        echo = resolved_echo
+      )
+    )
+    slash_commands(cmds)
+
+    function() {
+      cmds <- isolate(slash_commands())
+      cmds[[name]] <- NULL
+      slash_commands(cmds)
+    }
+  }
+
+  client_clear <- function(
+    messages = NULL,
+    greeting = FALSE,
+    client_history = c("clear", "set", "append", "keep")
+  ) {
+    client_history <- arg_match(client_history)
+
+    hist_ctrl <- history_controller()
+    if (!is.null(hist_ctrl)) {
+      cli::cli_abort(
+        "Can't clear a chat with conversation history enabled. Use {.code chat$new_chat()} to start a new conversation."
+      )
+    }
+
+    if (append_stream_task$status() == "running") {
+      cli::cli_abort(
+        "Can't clear the chat while a response is still being generated. Please wait for it to finish or stop it first."
+      )
+    }
+
+    if (!is.null(messages)) {
+      if (rlang::is_string(messages)) {
+        # Promote strings to single assistant message
+        messages <- list(list(role = "assistant", content = messages))
+      }
+      if (!rlang::is_list(messages)) {
+        cli::cli_abort(
+          "{.var messages} must be a list of messages, and each message must be a list with {.field role} and {.field content}."
+        )
+      }
+      if (length(intersect(c("role", "content"), names(messages))) == 2) {
+        # Catch the single-message case and promote it to a list of messages
+        messages <- list(messages)
+      }
+    }
+
+    chat_clear(id, greeting = greeting, session = session)
+    if (!is.null(messages)) {
+      for (msg in messages) {
+        chat_append(id, msg$content, role = msg$role, session = session)
+      }
+    }
+
+    if (client_history == "clear") {
+      client$set_turns(list())
+    } else if (client_history == "set") {
+      client$set_turns(as_ellmer_turns(messages))
+    } else if (client_history == "append") {
+      turns <- client$get_turns()
+      turns <- c(turns, as_ellmer_turns(messages))
+      client$set_turns(turns)
+    }
+
+    last_turn(NULL)
+    last_input(NULL)
+  }
+
+  client_new_chat <- function(greeting = FALSE) {
+    hist_ctrl <- history_controller()
+    if (is.null(hist_ctrl)) {
+      cli::cli_abort(
+        "Can't start a new chat without conversation history enabled. Use {.code chat$clear()} instead."
+      )
+    }
+    if (append_stream_task$status() == "running") {
+      cli::cli_abort(
+        "Can't start a new chat while a response is still being generated. Please wait for it to finish or stop it first."
+      )
+    }
+
+    hist_ctrl$new_chat(greeting = greeting)
+    last_turn(NULL)
+    last_input(NULL)
+    invisible()
+  }
+
+  ret <- new.env(parent = emptyenv())
+  ret$last_turn <- shiny::reactive(last_turn(), label = "mod_last_turn")
+  ret$last_input <- shiny::reactive(last_input(), label = "mod_last_input")
+  # Derived rather than stored, so it cannot go stale: the task moves to
+  # "running" on the next turn and to "success" when one lands, and this
+  # follows. Nothing else reads the task's result, so a rejection is otherwise
+  # captured by the task and dropped -- `status()` reports a finished and a
+  # failed response alike as "idle".
+  ret$last_error <- shiny::reactive(label = "mod_last_error", {
+    if (append_stream_task$status() == "error") {
+      tryCatch(append_stream_task$result(), error = identity)
+    } else {
+      NULL
+    }
+  })
+  ret$status <- shiny::reactive(label = "mod_status", {
+    if (append_stream_task$status() == "running") "streaming" else "idle"
+  })
+  makeActiveBinding("client", function() client, ret)
+  ret$append <- chat_append_mod
+  ret$update_user_input <- chat_update_user_input
+  ret$clear <- client_clear
+  ret$new_chat <- client_new_chat
+  ret$set_greeting <- set_greeting_mod
+  ret$set_client <- set_client
+  ret$slash_command <- slash_command_method
+
+  hist_env <- new.env(parent = emptyenv())
+
+  hist_env$save <- function() {
+    ctrl <- get_session_chat_bookmark_info(
+      session,
+      paste0(id, ".history-controller")
+    )
+    if (is.null(ctrl)) {
+      return(FALSE)
+    }
+    ctrl$save()
+  }
+
+  hist_env$on_save <- function(fn) {
+    saved_on_save_fns <<- c(saved_on_save_fns, list(fn))
+    ctrl <- get_session_chat_bookmark_info(
+      session,
+      paste0(id, ".history-controller")
+    )
+    if (!is.null(ctrl)) {
+      ctrl$add_save_callback(fn)
+    }
+    invisible(fn)
+  }
+
+  hist_env$on_restore <- function(fn) {
+    saved_on_restore_fns <<- c(saved_on_restore_fns, list(fn))
+    ctrl <- get_session_chat_bookmark_info(
+      session,
+      paste0(id, ".history-controller")
+    )
+    if (!is.null(ctrl)) {
+      ctrl$add_restore_callback(fn)
+    }
+    invisible(fn)
+  }
+
+  hist_env$conversation_id <- shiny::reactive(label = "mod_conversation_id", {
+    hist_ctrl <- history_controller()
+    if (is.null(hist_ctrl)) {
+      return(NULL)
+    }
+    hist_ctrl$conversation_id()
+  })
+
+  lockEnvironment(hist_env)
+  ret$history <- hist_env
+
+  lockEnvironment(ret)
+  ret
+}
+
+#' @describeIn chat_mod_ui A Shiny module server for chat (deprecated). Use [chat_server()] instead.
+#' @export
+chat_mod_server <- function(
+  id,
+  client,
+  greeting = NULL,
+  history = TRUE,
+  bookmark_on_input = lifecycle::deprecated(),
+  bookmark_on_response = lifecycle::deprecated()
+) {
+  lifecycle::deprecate_soft("0.5.0", "chat_mod_server()", "chat_server()")
+  check_ellmer_chat(client)
+  shiny::moduleServer(id, function(input, output, session) {
+    chat_server(
+      "chat",
+      client,
+      greeting = greeting,
+      history = history,
+      bookmark_on_input = bookmark_on_input,
+      bookmark_on_response = bookmark_on_response,
+      session = session
+    )
+  })
+}

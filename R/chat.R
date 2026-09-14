@@ -1,0 +1,2273 @@
+# This is a stripped-down port of the ui.Chat feature in py-shiny. The main
+# things it's missing are server-side state management, i.e. the py-shiny
+# version will keep the list of messages for you, and will handle the
+# trimming of the message history to fit within the context window; these
+# are left for the caller to handle in the R version.
+
+#' Create a greeting for a chat UI
+#'
+#' @description
+#' Creates a greeting object for use with [chat_ui()] or [chat_set_greeting()].
+#' A greeting is displayed when the chat first loads and is dismissed when the
+#' user sends their first message.
+#'
+#' @param content The greeting content. Can be:
+#'   * A string, interpreted as markdown.
+#'   * An [htmltools::HTML()] object, rendered as raw HTML.
+#'   * An htmltools tag or [htmltools::tagList()], including Shiny
+#'     inputs/outputs.
+#'   * A generator or promise (only valid when used with `chat_set_greeting()`).
+#' @param persistent Whether the greeting persists after the user sends a
+#'   message. Defaults to `FALSE`, meaning the greeting is dismissed when the
+#'   user sends their first message.
+#' @param ... These dots are for future extensions and must be empty.
+#' @param dismissible `r lifecycle::badge("deprecated")` Renamed to
+#'   `persistent` with an inverted value. `dismissible = FALSE` is equivalent
+#'   to `persistent = TRUE`.
+#'
+#' @returns An S3 object of class `"chat_greeting"`.
+#'
+#' @section Patterns:
+#'
+#' **Persistent greeting** (stays visible after the user sends a message):
+#'
+#' ```r
+#' chat_greeting("Please read our [terms of service](https://example.com).", persistent = TRUE)
+#' ```
+#'
+#' **Greeting with suggestion cards** (clickable chips that fill the input):
+#'
+#' ```r
+#' chat_greeting(paste(
+#'   "## Welcome!\n\n",
+#'   "Try one of these:\n\n",
+#'   '<span class="suggestion">Summarize my data</span>\n',
+#'   '<span class="suggestion">Create a plot</span>\n',
+#'   '<span class="suggestion">Explain this code</span>'
+#' ))
+#' ```
+#'
+#' **Greeting with HTML tags** (Shiny inputs/outputs):
+#'
+#' ```r
+#' chat_greeting(htmltools::tagList(
+#'   htmltools::h2("Welcome!"),
+#'   shiny::selectInput("model", "Choose a model:", c("gpt-4o", "claude-3"))
+#' ))
+#' ```
+#'
+#' @examplesIf interactive()
+#' library(shiny)
+#' library(bslib)
+#' library(shinychat)
+#'
+#' ui <- page_fillable(
+#'   chat_ui(
+#'     "chat",
+#'     greeting = chat_greeting("## Welcome!\n\nHow can I help you today?")
+#'   )
+#' )
+#'
+#' server <- function(input, output, session) {
+#'   observeEvent(input$chat_user_input, {
+#'     response <- paste0("You said: ", input$chat_user_input)
+#'     chat_append("chat", response)
+#'   })
+#' }
+#'
+#' shinyApp(ui, server)
+#'
+#' @export
+chat_greeting <- function(
+  content,
+  ...,
+  persistent = FALSE,
+  dismissible = lifecycle::deprecated()
+) {
+  rlang::check_dots_empty()
+  if (lifecycle::is_present(dismissible) && is_missing(persistent)) {
+    lifecycle::deprecate_warn(
+      "0.4.1",
+      "chat_greeting(dismissible)",
+      "chat_greeting(persistent)",
+      details = "Note: the value is inverted \u2014 `dismissible = FALSE` becomes `persistent = TRUE`."
+    )
+    persistent <- !dismissible
+  }
+
+  if (is.character(content) && length(content) > 1) {
+    content <- paste(content, collapse = "\n")
+  }
+  structure(
+    list(
+      content = content,
+      persistent = persistent
+    ),
+    class = "chat_greeting"
+  )
+}
+
+#' Create a chat UI element
+#'
+#' @description
+#' Inserts a chat UI element into a Shiny UI, which includes a scrollable
+#' section for displaying chat messages, and an input field for the user to
+#' enter new messages.
+#'
+#' To respond to user input, listen for `input$ID_user_input` (for example, if
+#' `id="my_chat"`, user input will be at `input$my_chat_user_input`), and use
+#' [chat_append()] to append messages to the chat.
+#'
+#' @section Pairing with `chat_server()`:
+#'
+#' `chat_ui(id)` and `chat_server(id, client)` pair by matching `id`. This
+#' works the same way at the top level of an app and inside your own Shiny
+#' module — `chat_server()` is not itself a module, so no `NS(id, "chat")`
+#' wrapping is required:
+#'
+#' ```r
+#' # Top-level app, no module
+#' ui <- page_fillable(chat_ui("chat"))
+#' server <- function(input, output, session) {
+#'   chat_server("chat", client)
+#' }
+#' ```
+#'
+#' ```r
+#' # Inside your own module: pass the same literal id to both, and call
+#' # chat_server() from inside moduleServer() so it inherits the module's
+#' # already-namespaced `session`
+#' mod_ui <- function(id) {
+#'   ns <- NS(id)
+#'   chat_ui(ns("chat"))
+#' }
+#' mod_server <- function(id, client) {
+#'   moduleServer(id, function(input, output, session) {
+#'     chat_server("chat", client)
+#'   })
+#' }
+#' ```
+#'
+#' @section Greeting:
+#'
+#' A greeting is an optional welcome message shown before any conversation
+#' messages. It is automatically dismissed when the user sends their first
+#' message (unless created with `persistent = TRUE`).
+#'
+#' **Static greeting.** Pass a string or [chat_greeting()] to the `greeting`
+#' parameter:
+#'
+#' ```r
+#' chat_ui("chat", greeting = "## Hello!\n\nHow can I help you today?")
+#' ```
+#'
+#' **Dynamic greeting from the server.** Leave `greeting` unset and use
+#' [chat_set_greeting()] from your server function. This is useful when the
+#' greeting depends on session state or is generated by a model.
+#'
+#' **`greeting_requested` input.** When the chat is visible on the page, has
+#' no messages, and has no greeting set, Shiny fires
+#' `input$<id>_greeting_requested` (e.g. `input$chat_greeting_requested` for
+#' `chat_ui("chat")`). The value is an event counter suitable for
+#' [shiny::observeEvent()]. Use it to trigger server-side greeting generation:
+#'
+#' ```r
+#' observeEvent(input$chat_greeting_requested, {
+#'   stream <- chat_client$stream_async("Generate a short welcome message.")
+#'   chat_set_greeting("chat", chat_greeting(stream))
+#' })
+#' ```
+#'
+#' This input fires when the chat component is first viewed on the page and
+#' empty, and again after [chat_clear()] `(greeting = TRUE)`, enabling a
+#' regenerate pattern where clearing the greeting automatically triggers a
+#' fresh one.
+#'
+#' **`greeting_dismissed` input.** When the user dismisses the greeting,
+#' `input$<id>_greeting_dismissed` fires with a `Date.now()` timestamp. If the
+#' greeting is later cleared after being dismissed, the input resets to `NULL`.
+#' If you use [chat_server()], you can access the `greeting_dismissed`
+#' reactive from the returned value instead of the raw namespaced input
+#' string.
+#'
+#' @section Thinking display:
+#'
+#' When a model produces reasoning or "thinking" tokens, shinychat renders them
+#' in a collapsible panel above the response. The panel shows a live stream of
+#' the model's reasoning while it thinks, then auto-collapses when the response
+#' begins.
+#'
+#' Thinking display works automatically with any model that supports it. Two
+#' paths are supported:
+#'
+#' 1. **ellmer's `ContentThinking` objects.** Models that provide a structured
+#'    thinking API (e.g., Claude with extended thinking) emit `ContentThinking`
+#'    objects when you stream with `stream = "content"`. shinychat detects these
+#'    and routes them to the thinking panel. This is what `chat_append()` uses
+#'    internally when you pass it an ellmer content stream.
+#'
+#' 2. **Raw `<thinking>` tags.** Many open-source and local models (DeepSeek,
+#'    QwQ, Qwen, etc.) emit `<thinking>...</thinking>` tags directly in their
+#'    markdown output. shinychat detects these tags during streaming and renders
+#'    the enclosed text in the thinking panel with no extra configuration.
+#'
+#' ## Topic labels
+#'
+#' You can optionally get labeled sub-sections within the thinking panel by
+#' asking the model to emit `<topic>...</topic>` tags in its reasoning. These
+#' are extracted and rendered as section headings inside the thinking display,
+#' and the current topic appears in the collapsed header as a live status.
+#'
+#' To use topic labels, add something like this to your system prompt:
+#'
+#' ```
+#' When thinking through a problem, wrap brief topic labels in <topic> tags
+#' to indicate what you're currently reasoning about. For example:
+#' <topic>parsing the input</topic>
+#' ```
+#'
+#' Topic labels are entirely optional. Without them, the thinking panel still
+#' works -- it just won't have sub-section headings.
+#'
+#' Set `show_thinking_after_s` in [chat_ui()] to delay the thinking panel until a
+#' contiguous thinking block has run for a minimum number of seconds. The
+#' default, `0`, displays thinking immediately; a negative value always hides
+#' it. Values greater than 60 seconds are not supported. Durations are measured
+#' in the browser while streaming, so preloaded or restored thinking is
+#' displayed only with the default.
+#'
+#' @section Customizing the send button:
+#'
+#' The send button is a filled circle (24px by default) whose background
+#' color reflects the current state (primary when ready, gray when
+#' empty/disabled, danger when cancelling) with a white icon (22px by
+#' default) centered inside. The `icon_send` parameter swaps the
+#' ready-state icon without changing the button's surface.
+#'
+#' **Custom icon.** Pass an SVG from [bsicons::bs_icon()] or
+#' `fontawesome::fa()`. The button provides the surface, so a bare glyph
+#' gets the same filled-circle treatment as the default arrow:
+#'
+#' ```r
+#' chat_ui("chat", icon_send = bsicons::bs_icon("send-fill"))
+#' ```
+#'
+#' **Icon with text.** Use [htmltools::tagList()] to pass an icon and a text
+#' label as siblings (not wrapped in a `<span>`) so they lay out side by
+#' side, with a Bootstrap margin utility for spacing. Then override the
+#' button to size to its content instead of the default fixed circle:
+#'
+#' ```r
+#' chat_ui("chat",
+#'   icon_send = tagList(
+#'     bsicons::bs_icon("airplane-fill"),
+#'     span("Send", class = "ms-2")
+#'   )
+#' )
+#' ```
+#'
+#' ```css
+#' :root .shiny-chat-btn-send {
+#'   width: auto;
+#'   height: auto;
+#'   padding: 4px 10px;
+#'   border-radius: 6px;
+#' }
+#' ```
+#'
+#' **Per-state color overrides.** Each state's color can be set independently
+#' via CSS variables on the chat container or any ancestor. These are only
+#' read by the component (never set on the button), so inline styles inherit
+#' cleanly:
+#'
+#' ```css
+#' #chat {
+#'   --shiny-chat-btn-send-color-cancel: #abc123;
+#' }
+#' ```
+#'
+#' **Ghost (outline) style.** Make the button transparent at rest with the
+#' state color on the icon and border, filling on hover. Target the button
+#' element (not an ancestor) because the internal `--_btn-send-state-color`
+#' variable resolves on the button itself:
+#'
+#' ```css
+#' :root .shiny-chat-btn-send {
+#'   --shiny-chat-btn-send-bg: transparent;
+#'   --shiny-chat-btn-send-color: var(--_btn-send-state-color);
+#'   --shiny-chat-btn-send-border: 1px solid var(--_btn-send-state-color);
+#'   --shiny-chat-btn-send-color-hover: #fff;
+#'   --shiny-chat-btn-send-bg-hover: var(--_btn-send-state-color);
+#' }
+#' ```
+#'
+#' **Key CSS variables:**
+#'
+#'   * `--shiny-chat-btn-send-size` — Button width and height (default `24px`)
+#'   * `--shiny-chat-input-icon-size` — Icon size, shared with the attach button (default `22px`)
+#'   * `--shiny-chat-btn-send-bg` — Button background (default: state color)
+#'   * `--shiny-chat-btn-send-color` — Icon color (default: `#fff`)
+#'   * `--shiny-chat-btn-send-border` — Button border (default: `none`)
+#'   * `--shiny-chat-btn-send-color-ready` — Override ready/pending color (default: `--bs-primary`)
+#'   * `--shiny-chat-btn-send-color-empty` — Override empty/disabled color (default: `--bs-gray-500`)
+#'   * `--shiny-chat-btn-send-color-cancel` — Override cancel/cancelling color (default: `--bs-danger`)
+#'
+#' @examplesIf interactive()
+#' library(shiny)
+#' library(bslib)
+#' library(shinychat)
+#'
+#' ui <- page_fillable(
+#'   chat_ui("chat", fill = TRUE)
+#' )
+#'
+#' server <- function(input, output, session) {
+#'   observeEvent(input$chat_user_input, {
+#'     # In a real app, this would call out to a chat client or API,
+#'     # perhaps using the 'ellmer' package.
+#'     response <- paste0(
+#'       "You said:\n\n",
+#'       "<blockquote>",
+#'       htmltools::htmlEscape(input$chat_user_input),
+#'       "</blockquote>"
+#'     )
+#'     chat_append("chat", response)
+#'   })
+#' }
+#'
+#' shinyApp(ui, server)
+#'
+#' @param id The ID of the chat element
+#' @param ... Extra HTML attributes to include on the chat element
+#' @param messages Deprecated. A list of messages to prepopulate the chat with.
+#'   Startup messages can't be recorded by the conversation-history feature.
+#'   Use `greeting` for a startup message, `chat_append()` to replay messages
+#'   from the server, or set `history = FALSE` in [chat_server()] if you're
+#'   managing conversation state yourself. Each message can be one of the following:
+#'
+#'   * A string, which is interpreted as markdown and rendered to HTML on the
+#'     client.
+#'     * To prevent interpreting as markdown, mark the string as
+#'       [htmltools::HTML()].
+#'   * A UI element.
+#'     * This includes [htmltools::tagList()], which takes UI elements
+#'       (including strings) as children. Strings inside a tagList are
+#'       literal text (HTML-escaped), not markdown. Use
+#'       [htmltools::HTML()] for trusted raw HTML strings.
+#'   * A named list of `content` and `role`. The `content` can contain content
+#'     as described above, and the `role` can be "assistant" or "user".
+#'   * Advanced: a `list()` mixing bare strings and UI elements interleaves
+#'     markdown and HTML in one message, in order. This API is provisional
+#'     and may change in a future release.
+#'
+#' @param greeting An optional greeting to display when the chat first loads.
+#'   Can be a [chat_greeting()] object, or a plain string (which is auto-wrapped
+#'   with default options). The greeting is dismissed when the user sends their
+#'   first message. For example: `greeting = chat_greeting("## Hello!\n\nHow can
+#'   I help you today?")`
+#' @param placeholder The placeholder text for the chat's user input field
+#' @param width The CSS width of the chat element
+#' @param height The CSS height of the chat element
+#' @param fill Whether the chat element should try to vertically fill its
+#'   container, if the container is
+#'   [fillable](https://rstudio.github.io/bslib/articles/filling/index.html)
+#' @param icon_assistant The icon to use for the assistant chat messages.
+#'   Can be HTML or a tag in the form of [htmltools::HTML()] or
+#'   [htmltools::tags()]. `NULL` (the default) or `FALSE` omits the assistant
+#'   icon entirely. Pass `TRUE` to use the built-in robot icon (individual
+#'   messages can still opt in to a different icon via the `icon` argument of
+#'   [chat_append()]).
+#' @param icon_send The icon to use for the chat input's ready-state submit
+#'   button. Can be HTML or a tag in the form of [htmltools::HTML()] or
+#'   [htmltools::tags()]. If `NULL` (the default) or `FALSE`, a default arrow icon is
+#'   used. The button provides a filled circular surface (state-colored
+#'   background, white icon); the supplied icon replaces only the glyph inside
+#'   it. See the "Customizing the send button" section below for styling
+#'   patterns.
+#' @param enable_cancel Whether to show a stop button during streaming that
+#'   allows the user to cancel the in-progress response. When using
+#'   [chat_server()], cancellation is wired up automatically and this defaults
+#'   to `NULL` (let the server decide). For manual usage without
+#'   [chat_server()], set `TRUE` or `FALSE` explicitly and observe
+#'   `input$<id>_cancel` to handle cancellation (e.g., by calling
+#'   `ctrl$cancel()` on an ellmer `stream_controller()`).
+#' @param submit_key Controls which key combination submits the chat message.
+#'   `"enter"` (the default): Enter submits, Shift+Enter adds a newline.
+#'   `"enter+modifier"`: Ctrl+Enter (Cmd+Enter on Mac) submits, plain Enter adds
+#'   a newline.
+#' @param allow_attachments Controls the file-attachment affordance (an attach
+#'   button, plus clipboard paste and drag-and-drop) in the chat input. `NULL`
+#'   (default) defers to [chat_server()], which enables attachments
+#'   automatically. Pass `TRUE` to accept all supported types (PNG, JPEG, GIF,
+#'   WebP, PDF, and common text/code files such as Markdown, plain text, CSV,
+#'   JSON, and source files), `FALSE` to disable, or a character vector of MIME
+#'   types to restrict what is accepted (each must be one of the supported
+#'   types).
+#'
+#'   The shape of `input$<id>_user_input` is determined by this argument, so it
+#'   is predictable for a given app. When attachments are disabled (the
+#'   default), it is the typed text as a character string, exactly as before.
+#'   When attachments are enabled, it is always a list of ellmer
+#'   [ellmer::Content] objects (the typed text, if any, followed by one content
+#'   object per attachment) - a list even when no files were attached. Splice
+#'   the list into a chat method's `...` with `!!!`, e.g.
+#'   `client$stream_async(!!!input$<id>_user_input)`. (No [rlang::inject()] is
+#'   needed: ellmer's chat methods collect `...` with dynamic dots.)
+#'
+#'   The maximum combined size of all attachments in a single message is
+#'   controlled globally by the `SHINYCHAT_MAX_ATTACHMENT_SIZE` environment
+#'   variable (a raw byte count; defaults to approximately 30 MB). Files that
+#'   would push the total over this cap are rejected in the browser with a
+#'   notice.
+#' @param toolbar_input Optional HTML content to display directly below the chat
+#'   input. Use [bslib::toolbar()] to group toolbar controls.
+#' @param footer Optional HTML content to display in a bottom-pinned, full-width
+#'   chat region.
+#'   This can be any HTML content (tags, tag lists, or character strings).
+#'   Useful for adding disclaimers, attribution, or other information.
+#'   The footer text is styled slightly smaller and lighter than body text
+#'   by default. Customize with CSS properties `--shiny-chat-footer-font-size`
+#'   and `--shiny-chat-footer-color` on the chat container or footer element.
+#' @param drawer Whether to enable the drawer. `TRUE` (the default)
+#'   enables an initially hidden panel with default options, `FALSE` omits it,
+#'   and [chat_drawer()] supplies its initial configuration.
+#' @param show_history Whether to show the built-in history selector. Defaults
+#'   to `TRUE`; setting it to `FALSE` only hides its presentation.
+#' @param tool_grouping Controls how tool calls are grouped together in the
+#'   compact activity rows:
+#'   * `"tool"` (default): calls to the *same* tool within a turn's contiguous
+#'     tool loop are grouped into one activity row. This groups by tool name
+#'     across the whole loop, not just consecutive calls -- e.g. calls to tools
+#'     `X`, `Y`, `Z`, `X`, `Y` (in that order) are grouped into `X` (2 calls),
+#'     `Y` (2 calls), and `Z` (1 call).
+#'   * `"all"`: every tool call within a contiguous tool loop is summarized in
+#'     one activity row, regardless of tool name.
+#'   * `"none"`: each tool call is shown in its own activity row. Its request
+#'     and result remain available by drilling into that row; this does not
+#'     restore an always-visible card stack.
+#'
+#'   Prose or thinking between tool calls starts a new tool loop, so calls on
+#'   opposite sides of either boundary never group together. Individual tools
+#'   can override `"tool"` or `"all"` via a top-level `grouping` tool
+#'   annotation, e.g. `ellmer::tool(..., annotations =
+#'   ellmer::tool_annotations(grouping = "all"))`. `tool_grouping = "none"`
+#'   takes precedence over every annotation and disables grouping for the whole
+#'   chat.
+#' @param show_thinking_after_s The minimum number of seconds a contiguous
+#'   thinking block must run before it is displayed. Defaults to `0`, which
+#'   displays thinking immediately. Positive values hide shorter blocks;
+#'   negative values always hide thinking. Values must not exceed 60 seconds.
+#'
+#' @returns A Shiny tag object, suitable for inclusion in a Shiny UI
+#' @export
+chat_ui <- function(
+  id,
+  ...,
+  greeting = NULL,
+  placeholder = "Enter a message...",
+  drawer = TRUE,
+  footer = NULL,
+  toolbar_input = NULL,
+  show_history = TRUE,
+  show_thinking_after_s = 0,
+  width = "min(clamp(680px, 50vw, 760px), 100%)",
+  height = "auto",
+  fill = TRUE,
+  icon_assistant = NULL,
+  icon_send = NULL,
+  enable_cancel = NULL,
+  submit_key = c("enter", "enter+modifier"),
+  allow_attachments = NULL,
+  tool_grouping = c("tool", "none", "all"),
+  messages = NULL
+) {
+  submit_key <- rlang::arg_match(submit_key)
+  tool_grouping <- rlang::arg_match(tool_grouping)
+  if (
+    !is.numeric(show_thinking_after_s) ||
+      length(show_thinking_after_s) != 1 ||
+      is.na(show_thinking_after_s) ||
+      !is.finite(show_thinking_after_s) ||
+      show_thinking_after_s > 60
+  ) {
+    rlang::abort(
+      "`show_thinking_after_s` must be a finite number no greater than 60 seconds."
+    )
+  }
+  if (!is.null(messages)) {
+    lifecycle::deprecate_warn(
+      "0.5.0",
+      "chat_ui(messages = )",
+      details = c(
+        "Startup messages can't be recorded by the conversation-history feature.",
+        "Use `greeting` for a startup message, `chat_append()` to replay messages from the server, or set `history = FALSE` in `chat_server()` if you're managing conversation state yourself."
+      )
+    )
+  }
+  chat_validate_boolean(show_history, "show_history")
+  drawer <- normalize_chat_drawer(drawer)
+  # `NULL` (the default) means no assistant icon; `TRUE` opts back into the
+  # built-in robot icon (see `resolve_icon_attr()`).
+  icon_assistant <- icon_assistant %||% FALSE
+
+  attrs <- rlang::list2(...)
+  if (!all(nzchar(rlang::names2(attrs)))) {
+    rlang::abort("All arguments in ... must be named.")
+  }
+
+  icon_attr <- resolve_icon_attr(icon_assistant)
+
+  # Block-carrying initial messages go into data-initial-messages JSON
+  # (static tags carry strings only); html deps attach to the container.
+  # Mirrors Python's chat_ui().
+  initial_messages_attr <- NULL
+  initial_message_deps <- list()
+
+  any_blocks <- FALSE
+  if (!is.null(messages) && length(messages) > 0) {
+    for (msg in messages) {
+      content <- msg
+      if (
+        is.list(msg) &&
+          !inherits(msg, "shinychat_block") &&
+          ("content" %in% names(msg))
+      ) {
+        content <- msg[["content"]]
+      }
+      if (message_has_blocks(content)) {
+        any_blocks <- TRUE
+        break
+      }
+    }
+  }
+
+  if (any_blocks) {
+    initial_entries <- list()
+    for (msg in messages) {
+      payload <- initial_message_payload(msg, icon_attr)
+      initial_entries[[length(initial_entries) + 1]] <- payload$entry
+      initial_message_deps <- c(initial_message_deps, payload$deps)
+    }
+    initial_messages_attr <- jsonlite::toJSON(
+      initial_entries,
+      auto_unbox = TRUE,
+      null = "null"
+    )
+  }
+
+  message_tags <- if (any_blocks) {
+    list()
+  } else {
+    lapply(messages, function(x) {
+      role <- "assistant"
+      content <- x
+      if (
+        is.list(x) &&
+          !inherits(x, "shinychat_block") &&
+          ("content" %in% names(x))
+      ) {
+        content <- x[["content"]]
+        role <- x[["role"]] %||% role
+      }
+
+      # `content` is most likely a string, so avoid overhead in that case
+      # (it's also important that we *don't escape HTML* here).
+      if (is.character(content)) {
+        ui <- list(html = paste(content, collapse = "\n"), deps = list())
+      } else {
+        ui <- render_island_string(content)
+      }
+
+      tag(
+        "shiny-chat-message",
+        rlang::list2(
+          `data-role` = role,
+          content = ui[["html"]],
+          # The assistant default must not leak onto user messages, which render
+          # `message.icon` directly (no assistant fallback chain).
+          icon = if (!identical(role, "user")) icon_attr,
+          ui[["deps"]],
+        )
+      )
+    })
+  }
+
+  toolbar_tag <- NULL
+  if (!is.null(toolbar_input)) {
+    toolbar_tag <- tag("shiny-chat-input-toolbar", list(toolbar_input))
+  }
+  footer_tag <- NULL
+  if (!is.null(footer)) {
+    footer_tag <- tag("shiny-chat-footer", list(footer))
+  }
+  artifact_tag <- if (!is.null(drawer)) {
+    chat_drawer_tag(drawer)
+  }
+
+  # Process greeting -------------------------------------------------------
+  greeting_attr <- NULL
+  greeting_deps <- list()
+
+  if (!is.null(greeting)) {
+    # Auto-wrap plain strings and HTML/tag content
+    if (!inherits(greeting, "chat_greeting")) {
+      greeting <- chat_greeting(greeting)
+    }
+
+    content <- greeting$content
+
+    # Generators/promises are not allowed in chat_ui() (static context)
+    if (
+      inherits(content, "coro_generator_instance") ||
+        promises::is.promising(content)
+    ) {
+      cli::cli_abort(
+        c(
+          "A generator or promise cannot be used as a static {.arg greeting} in {.fn chat_ui}.",
+          i = "Use {.fn chat_set_greeting} from the server to set a dynamic or streaming greeting."
+        )
+      )
+    }
+
+    if (is.character(content) && !inherits(content, "html")) {
+      # Plain markdown string
+      greeting_content <- content
+      greeting_content_type <- "markdown"
+    } else if (
+      inherits(content, "html") &&
+        !inherits(content, c("shiny.tag", "shiny.tag.list"))
+    ) {
+      # htmltools::HTML() - raw HTML string
+      greeting_content <- as.character(content)
+      greeting_content_type <- "html"
+    } else {
+      # htmltools tag or tagList - render to HTML and collect deps
+      rendered <- render_island_string(content)
+      greeting_content <- rendered$html
+      greeting_content_type <- "html"
+      greeting_deps <- rendered$deps
+    }
+
+    greeting_payload <- list(
+      content = greeting_content,
+      content_type = greeting_content_type,
+      options = list(
+        persistent = isTRUE(greeting$persistent)
+      )
+    )
+    greeting_attr <- jsonlite::toJSON(greeting_payload, auto_unbox = TRUE)
+  }
+
+  attachment_attrs <- resolve_attachment_attrs(allow_attachments)
+  # Always emitted (mirrors Python). Harmless when attachments are disabled:
+  # the client only reads it when the attachment affordance is enabled.
+  max_attachment_size <- trimws(
+    format(resolve_max_attachment_size(), scientific = FALSE)
+  )
+
+  # Build UI ---------------------------------------------------------------
+  res <- tag(
+    "shiny-chat-container",
+    rlang::list2(
+      id = id,
+      # `width` is emitted as a pseudo-private custom property consumed by
+      # `.shiny-chat-wrapper` (as max-width), so the container itself stays
+      # full-width and the drawer scrim can span it.
+      style = css(
+        `--_chat-width` = width,
+        height = height
+      ),
+      placeholder = placeholder,
+      fill = if (isTRUE(fill)) NA else NULL,
+      `aside-favicon` = if (!resolve_aside_favicon()) "false",
+      `enable-cancel` = if (isTRUE(enable_cancel)) {
+        NA
+      } else if (isFALSE(enable_cancel)) {
+        "false"
+      } else {
+        NULL
+      },
+      `submit-key` = if (submit_key != "enter") submit_key,
+      `tool-grouping` = if (tool_grouping != "tool") tool_grouping,
+      `show-thinking-after-s` = if (show_thinking_after_s != 0) {
+        format(show_thinking_after_s, scientific = FALSE)
+      },
+      `show-history` = if (!show_history) "false",
+      `allow-attachments` = attachment_attrs$allow,
+      `attachment-accept` = attachment_attrs$accept,
+      `max-attachment-size` = max_attachment_size,
+      # Also include icon on the parent so that when messages are dynamically added,
+      # we know the default icon has changed
+      `icon-assistant` = resolve_icon_attr(icon_assistant),
+      `icon-send` = resolve_send_icon_attr(icon_send),
+      greeting = greeting_attr,
+      `data-initial-messages` = initial_messages_attr,
+      ...,
+      tag("shiny-chat-messages", message_tags),
+      tag(
+        "shiny-chat-input",
+        list(id = paste0(id, "_user_input"), placeholder = placeholder)
+      ),
+      toolbar_tag,
+      footer_tag,
+      artifact_tag,
+      shinychat_deps(),
+      htmltools::findDependencies(icon_assistant),
+      htmltools::findDependencies(icon_send),
+      greeting_deps,
+      initial_message_deps
+    )
+  )
+
+  if (isTRUE(fill)) {
+    res <- bslib::as_fill_carrier(res)
+  }
+
+  tag_require(res, version = 5, caller = "chat_ui")
+}
+
+resolve_aside_favicon <- function() {
+  value <- tolower(
+    Sys.getenv("SHINYCHAT_ASIDE_FAVICON", unset = "true")
+  )
+  if (identical(value, "true")) {
+    return(TRUE)
+  }
+  if (identical(value, "false")) {
+    return(FALSE)
+  }
+  cli::cli_abort(
+    "{.envvar SHINYCHAT_ASIDE_FAVICON} must be {.val true} or {.val false}, got {.val {value}}."
+  )
+}
+
+#' Append an assistant response (or user message) to a chat control
+#'
+#' @description
+#' The `chat_append` function appends a message to an existing [chat_ui()]. The
+#' `response` can be a string, string generator, string promise, or string
+#' promise generator (as returned by the 'ellmer' package's `chat`, `stream`,
+#' `chat_async`, and `stream_async` methods, respectively).
+#'
+#' This function should be called from a Shiny app's server. It is generally
+#' used to append the client's response to the chat, while user messages are
+#' added to the chat UI automatically by the front-end. You'd only need to use
+#' `chat_append(role="user")` if you are programmatically generating queries
+#' from the server and sending them on behalf of the user, and want them to be
+#' reflected in the UI.
+#'
+#' # Error handling
+#'
+#' If the `response` argument is a generator, promise, or promise generator, and
+#' an error occurs while producing the message (e.g., an iteration in
+#' `stream_async` fails), the promise returned by `chat_append` will reject with
+#' the error. If the `chat_append` call is the last expression in a Shiny
+#' observer, shinychat will log the error message and show a message that the
+#' error occurred in the chat UI.
+#'
+#' # Asides
+#'
+#' An aside is a small pill that appears at the end of the paragraph or list
+#' item it's attached to, showing a popover on hover, click, or keyboard
+#' focus. Create one by writing (or prompting an LLM to write) an inline
+#' `<shiny-aside>` tag anywhere in a block's markdown; the tag's content
+#' becomes the popover body:
+#'
+#' * `<shiny-aside label="a source name" url="https://...">markdown shown in the popover</shiny-aside>`
+#'
+#' `label` controls the text on the identity chip. A safe `url` makes the
+#' source heading in the popover a link. It also supplies a derived favicon
+#' unless `icon` overrides it. Without a `label`, the aside falls back to a
+#' plain numbered marker. The body is ordinary markdown: inline for a one-liner,
+#' or — by separating it with blank lines — a rich block body (paragraphs,
+#' lists, code) shown in the popover. Labeled asides in the same paragraph or
+#' list item collapse into one pill, with each aside kept as a separate popover
+#' page. Each unlabeled aside remains a separate numbered pill. The grouped
+#' pill shows a `+N` overflow count only when its labeled asides have different
+#' labels. Asides that share one label use a single face with no count.
+#'
+#' Set these CSS properties on the chat container to style aside markers:
+#'
+#' * `--shiny-chat-aside-marker-color`
+#' * `--shiny-chat-aside-marker-hover-color`
+#' * `--shiny-chat-aside-marker-bg`
+#' * `--shiny-chat-aside-marker-hover-bg`
+#' * `--shiny-chat-aside-marker-font-family`
+#'
+#' `grounded-span` identifies the answer text that is related to an aside.
+#' Its value must exactly match text before the tag in the same paragraph or
+#' list item. When the popover opens, shinychat highlights the most recent
+#' match. If the value does not match, no text is highlighted.
+#'
+#' Long content wraps and scrolls within the viewport. The popover keeps the
+#' nearest scoped Bootstrap theme. In a paged popover, page changes are
+#' announced to assistive technology without repeating the body.
+#'
+#' Set `display="compact"` to show a compact numbered reference in the message.
+#' The popover retains the source label. Compact asides in the same paragraph or
+#' list item share a marker, such as `[2, 3]`.
+#' To style only compact markers, set the CSS properties above on
+#' `[data-shinychat-aside-display="compact"]`.
+#'
+#' The favicon is fetched at render time from a third-party service
+#' (DuckDuckGo's icon service), which receives the cited site's hostname. To
+#' avoid that request — for privacy, or for offline/air-gapped deployments —
+#' set the `SHINYCHAT_ASIDE_FAVICON` environment variable to `false`. You can
+#' still set `icon` to a URL you control; an explicit `icon` bypasses the
+#' lookup entirely.
+#'
+#' **A labeled aside with a grounded span and a one-line body:**
+#'
+#' ```r
+#' chat_append(
+#'   "chat",
+#'   paste0(
+#'     "Hub motors are cheaper",
+#'     paste0(
+#'       '<shiny-aside label="eBicycles" ',
+#'       'url="https://ebicycles.example/hub-vs-mid-drive" ',
+#'       'grounded-span="Hub motors are cheaper">'
+#'     ),
+#'     "[Hub Motor vs. Mid-Drive Motor Differences Explained]",
+#'     "(https://ebicycles.example/hub-vs-mid-drive)",
+#'     "</shiny-aside>",
+#'     ", and ideal for flatter terrain."
+#'   )
+#' )
+#' ```
+#'
+#' **Compact labeled asides that share one numbered marker:**
+#'
+#' ```r
+#' chat_append(
+#'   "chat",
+#'   paste0(
+#'     "Revenue is recognized at shipment",
+#'     '<shiny-aside display="compact" label="Revenue policy">',
+#'     "Exact revenue policy.</shiny-aside>",
+#'     " and records are retained for 30 days",
+#'     '<shiny-aside display="compact" label="Retention policy">',
+#'     "Exact retention policy.</shiny-aside>."
+#'   )
+#' )
+#' ```
+#'
+#' **Two asides cited in the same sentence** collapse into one pill (the
+#' first source's label becomes the face, with a "+1" overflow):
+#'
+#' ```r
+#' chat_append(
+#'   "chat",
+#'   paste0(
+#'     "Hub motors are cheaper",
+#'     '<shiny-aside label="eBicycles" url="https://ebicycles.example">...</shiny-aside>',
+#'     '<shiny-aside label="WIRED" url="https://wired.example">...</shiny-aside>',
+#'     ", and ideal for flatter terrain."
+#'   )
+#' )
+#' ```
+#'
+#' **A label-less aside with a rich block body** (falls back to a plain
+#' numbered pill):
+#'
+#' ```r
+#' chat_append(
+#'   "chat",
+#'   paste0(
+#'     "Battery quality matters more than raw power",
+#'     "<shiny-aside>\n\n",
+#'     "**Methodology**\n\n",
+#'     "- 40 commuter e-bike models\n",
+#'     "- released in 2024\n\n",
+#'     "</shiny-aside>"
+#'   )
+#' )
+#' ```
+#'
+#' @param id The ID of the chat element
+#' @param response The message or message stream to append to the chat element.
+#'   The actual message content can one of the following:
+#'
+#'   * A string, which is interpreted as markdown and rendered to HTML on
+#'     the client.
+#'     * To prevent interpreting as markdown, mark the string as
+#'       [htmltools::HTML()].
+#'   * A UI element.
+#'     * This includes [htmltools::tagList()], which takes UI elements
+#'       (including strings) as children. Strings inside a tagList are
+#'       literal text (HTML-escaped), not markdown. Use
+#'       [htmltools::HTML()] for trusted raw HTML strings.
+#'
+#' @param role The role of the message (either "assistant" or "user"). Defaults
+#'   to "assistant".
+#' @param icon An optional icon to display next to the message, currently only
+#'   used for assistant messages. The icon can be any HTML element (e.g., an
+#'   [htmltools::img()] tag) or a string of HTML. Pass `FALSE` to remove the
+#'   icon for this message, or `TRUE` to use the default icon.
+#' @param session The Shiny session object
+#'
+#' @returns Returns a promise that resolves to the contents of the stream, or an
+#'   error. This promise resolves when the message has been successfully sent to
+#'   the client; note that it does not guarantee that the message was actually
+#'   received or rendered by the client. The promise rejects if an error occurs
+#'   while processing the response (see the "Error handling" section).
+#'
+#' @examplesIf interactive()
+#' library(shiny)
+#' library(coro)
+#' library(bslib)
+#' library(shinychat)
+#'
+#' # Dumbest chatbot in the world: ignores user input and chooses
+#' # a random, vague response.
+#' fake_chatbot <- async_generator(function(input) {
+#'   responses <- c(
+#'     "What does that suggest to you?",
+#'     "I see.",
+#'     "I'm not sure I understand you fully.",
+#'     "What do you think?",
+#'     "Can you elaborate on that?",
+#'     "Interesting question! Let's examine thi... **See more**"
+#'   )
+#'
+#'   await(async_sleep(1))
+#'   for (chunk in strsplit(sample(responses, 1), "")[[1]]) {
+#'     yield(chunk)
+#'     await(async_sleep(0.02))
+#'   }
+#' })
+#'
+#' ui <- page_fillable(
+#'   chat_ui("chat", fill = TRUE)
+#' )
+#'
+#' server <- function(input, output, session) {
+#'   observeEvent(input$chat_user_input, {
+#'     response <- fake_chatbot(input$chat_user_input)
+#'     chat_append("chat", response)
+#'   })
+#' }
+#'
+#' shinyApp(ui, server)
+#'
+#' @export
+chat_append <- function(
+  id,
+  response,
+  role = c("assistant", "user"),
+  icon = NULL,
+  session = getDefaultReactiveDomain()
+) {
+  check_active_session(session)
+  role <- match.arg(role)
+
+  stream <- as_generator(response)
+  chat_append_stream(id, stream, role = role, icon = icon, session = session)
+}
+
+# Session-process block-level html dependencies and attach them to the
+# block's `html_deps` field. Returns list(block, deps).
+process_block_deps <- function(block, session) {
+  deps <- attr(block, "shinychat_html_deps")
+  if (is.null(deps) || length(deps) == 0) {
+    return(list(block = block, deps = list()))
+  }
+  # Remove the attribute so it doesn't serialize
+  attr(block, "shinychat_html_deps") <- NULL
+  processed <- process_ui(htmltools::tagList(!!!deps), session)
+  processed_deps <- processed[["deps"]] %||% list()
+  if (length(processed_deps) > 0) {
+    block$html_deps <- processed_deps
+  }
+  list(block = block, deps = processed_deps)
+}
+
+# Build wire segments from non-string HTML content via the shared island
+# derivation. Island items become html_block blocks; bare React elements stay
+# string parts. Mirrors Python's ChatMessage.__init__ non-string content path.
+#
+# tagList() content is an HTML container: bare strings inside it are escaped
+# text, NOT markdown. To mix markdown and UI, use list() content instead.
+build_html_island_segments <- function(content, session) {
+  parts <- derive_island_parts(content)
+  if (length(parts) == 0) {
+    return(list(segments = list(), deps = list()))
+  }
+
+  segments <- list()
+  all_deps <- list()
+
+  for (part in parts) {
+    if (inherits(part, "shinychat_island_block_part")) {
+      block <- new_html_block(part$html)
+      if (length(part$deps) > 0) {
+        attr(block, "shinychat_html_deps") <- part$deps
+      }
+      result <- process_block_deps(block, session)
+      all_deps <- c(all_deps, result$deps)
+      segments[[length(segments) + 1]] <- result$block
+    } else {
+      # Raw html_dependency objects must not enter all_deps directly — they
+      # cannot be JSON-serialized and would bypass session registration.
+      processed_deps <- serialize_html_deps(part$deps, session)
+      all_deps <- c(all_deps, processed_deps)
+      if (
+        length(segments) > 0 &&
+          is.character(segments[[length(segments)]]$content) &&
+          !"type" %in% names(segments[[length(segments)]])
+      ) {
+        segments[[length(segments)]]$content <-
+          paste0(segments[[length(segments)]]$content, part$html)
+      } else {
+        segments[[length(segments) + 1]] <- list(
+          content = part$html,
+          content_type = "html"
+        )
+      }
+    }
+  }
+
+  list(segments = segments, deps = all_deps)
+}
+
+new_html_block <- function(content) {
+  structure(
+    list(
+      type = "html_block",
+      version = 1L,
+      content = content
+    ),
+    class = c("shinychat_html_block", "shinychat_block")
+  )
+}
+
+# Append a markdown string segment, coalescing onto a preceding markdown
+# segment with a paragraph break (direct concatenation is unsafe at a
+# markdown seam). Mirrors coalesce_content_strings() and Python's
+# _parts_to_segments().
+append_markdown_segment <- function(segments, text) {
+  last <- if (length(segments) > 0) segments[[length(segments)]] else NULL
+  if (
+    !is.null(last) &&
+      !"type" %in% names(last) &&
+      identical(last$content_type, "markdown")
+  ) {
+    last$content <- paste(last$content, text, sep = "\n\n")
+    segments[[length(segments)]] <- last
+  } else {
+    segments[[length(segments) + 1]] <- list(
+      content = text,
+      content_type = "markdown"
+    )
+  }
+  segments
+}
+
+# Build wire segments from a shinychat_block or a mixed content list
+# (strings + blocks). Returns list(segments, deps).
+build_wire_segments <- function(content, session) {
+  all_deps <- list()
+
+  if (inherits(content, "shinychat_block")) {
+    block <- as.list(content)
+    result <- process_block_deps(block, session)
+    all_deps <- c(all_deps, result$deps)
+    list(segments = list(result$block), deps = all_deps)
+  } else {
+    segments <- list()
+    for (item in content) {
+      if (inherits(item, "shinychat_block")) {
+        block <- as.list(item)
+        result <- process_block_deps(block, session)
+        all_deps <- c(all_deps, result$deps)
+        segments[[length(segments) + 1]] <- result$block
+      } else if (is.character(item) && !inherits(item, "html")) {
+        segments <- append_markdown_segment(segments, as.character(item))
+      } else if (
+        inherits(item, c("html", "shiny.tag", "shiny.tag.list", "htmlwidget"))
+      ) {
+        # Route tag/HTML items through the HTML-island builder so ordinary
+        # tags become html_block islands, not bare HTML string segments.
+        island_result <- build_html_island_segments(item, session)
+        all_deps <- c(all_deps, island_result$deps)
+        segments <- c(segments, island_result$segments)
+      } else {
+        segments <- append_markdown_segment(segments, as.character(item))
+      }
+    }
+    list(segments = segments, deps = all_deps)
+  }
+}
+
+# Session-free variant of process_block_deps for the static chat_ui() path.
+# No session at render time, so raw html_dependency objects are collected
+# separately for the caller to attach to the container tag. Mirrors Python's
+# initial_message_payload().
+process_block_deps_static <- function(block) {
+  deps <- attr(block, "shinychat_html_deps")
+  # Strip the S3 class so jsonlite::toJSON serializes the block as a plain list.
+  block <- unclass(block)
+  if (is.null(deps) || length(deps) == 0) {
+    return(list(block = block, deps = list()))
+  }
+  attr(block, "shinychat_html_deps") <- NULL
+  list(block = block, deps = as.list(deps))
+}
+
+# Emit a block-carrying message's wire segments mid-stream as an ordered
+# action sequence: string segments as `chunk` actions, structured blocks as
+# `block_insert` actions. Mirrors Python's Chat._send_message_parts().
+#
+# Under replace semantics a replace sends a leading empty replace chunk (the
+# wipe) before any part, then emits every part as an append.
+send_wire_segment_actions <- function(
+  id,
+  wire_segments,
+  operation,
+  html_deps,
+  session
+) {
+  if (operation == "replace") {
+    wipe_action <- list(
+      type = "chunk",
+      content = "",
+      operation = "replace",
+      content_type = "markdown"
+    )
+    send_chat_action(
+      id,
+      action = wipe_action,
+      html_deps = html_deps,
+      session = session
+    )
+    operation <- "append"
+  }
+  for (seg in wire_segments) {
+    if ("type" %in% names(seg)) {
+      block_action <- list(type = "block_insert", block = seg)
+      send_chat_action(
+        id,
+        action = block_action,
+        html_deps = html_deps,
+        session = session
+      )
+    } else if (nzchar(seg$content)) {
+      chunk_action <- list(
+        type = "chunk",
+        content = seg$content,
+        operation = operation,
+        content_type = seg$content_type
+      )
+      send_chat_action(
+        id,
+        action = chunk_action,
+        html_deps = html_deps,
+        session = session
+      )
+    }
+  }
+}
+
+# Session-free variant of build_html_island_segments for the static chat_ui()
+# path. Returns list(segments, deps) where deps are raw html_dependency objects.
+build_html_island_segments_static <- function(content) {
+  parts <- derive_island_parts(content)
+  if (length(parts) == 0) {
+    return(list(segments = list(), deps = list()))
+  }
+
+  segments <- list()
+  all_deps <- list()
+
+  for (part in parts) {
+    if (inherits(part, "shinychat_island_block_part")) {
+      block <- new_html_block(part$html)
+      if (length(part$deps) > 0) {
+        attr(block, "shinychat_html_deps") <- part$deps
+      }
+      result <- process_block_deps_static(block)
+      all_deps <- c(all_deps, result$deps)
+      segments[[length(segments) + 1]] <- result$block
+    } else {
+      all_deps <- c(all_deps, part$deps)
+      if (
+        length(segments) > 0 &&
+          is.character(segments[[length(segments)]]$content) &&
+          !"type" %in% names(segments[[length(segments)]])
+      ) {
+        segments[[length(segments)]]$content <-
+          paste0(segments[[length(segments)]]$content, part$html)
+      } else {
+        segments[[length(segments) + 1]] <- list(
+          content = part$html,
+          content_type = "html"
+        )
+      }
+    }
+  }
+
+  list(segments = segments, deps = all_deps)
+}
+
+# Session-free variant of build_wire_segments for the static chat_ui() path.
+# Returns list(segments, deps) where deps are raw html_dependency objects for
+# the caller to attach to the container tag. Mirrors Python's
+# initial_message_payload().
+build_wire_segments_static <- function(content) {
+  all_deps <- list()
+
+  if (inherits(content, "shinychat_block")) {
+    block <- as.list(content)
+    result <- process_block_deps_static(block)
+    all_deps <- c(all_deps, result$deps)
+    list(segments = list(result$block), deps = all_deps)
+  } else {
+    segments <- list()
+    for (item in content) {
+      if (inherits(item, "shinychat_block")) {
+        block <- as.list(item)
+        result <- process_block_deps_static(block)
+        all_deps <- c(all_deps, result$deps)
+        segments[[length(segments) + 1]] <- result$block
+      } else if (is.character(item) && !inherits(item, "html")) {
+        segments <- append_markdown_segment(segments, as.character(item))
+      } else if (
+        inherits(item, c("html", "shiny.tag", "shiny.tag.list", "htmlwidget"))
+      ) {
+        island_result <- build_html_island_segments_static(item)
+        all_deps <- c(all_deps, island_result$deps)
+        segments <- c(segments, island_result$segments)
+      } else {
+        segments <- append_markdown_segment(segments, as.character(item))
+      }
+    }
+    list(segments = segments, deps = all_deps)
+  }
+}
+
+# Detect whether a message's content carries any shinychat_block content.
+# Any blocks at all → the whole list goes to JSON. Checks four forms
+# chat_ui() accepts: direct block, mixed list with blocks, string-typed
+# HTML, and non-string HTML that produces islands.
+message_has_blocks <- function(content) {
+  if (inherits(content, "shinychat_block")) {
+    return(TRUE)
+  }
+  if (
+    is.list(content) &&
+      !inherits(content, c("shiny.tag", "shiny.tag.list", "html", "htmlwidget"))
+  ) {
+    return(any(vapply(content, inherits, logical(1), "shinychat_block")))
+  }
+  # String-typed HTML: becomes a single html_block via the island derivation.
+  if (is.character(content) && inherits(content, "html")) {
+    return(TRUE)
+  }
+  # Non-string HTML content: check whether island splitting would produce
+  # any islands.
+  if (inherits(content, c("shiny.tag", "shiny.tag.list", "htmlwidget"))) {
+    islands <- split_html_islands(content)
+    return(any(vapply(islands, inherits, logical(1), "shinychat_island")))
+  }
+  FALSE
+}
+
+# Build one data-initial-messages JSON entry for a message, session-free.
+# Returns list(entry, deps) where entry = {role, segments, icon?, attachments?}
+# with html_deps stripped from every block, and deps = raw html_dependency
+# objects for the caller to attach to the container. Mirrors Python's
+# initial_message_payload().
+initial_message_payload <- function(msg, icon_attr) {
+  role <- "assistant"
+  content <- msg
+  if (
+    is.list(msg) &&
+      !inherits(msg, "shinychat_block") &&
+      ("content" %in% names(msg))
+  ) {
+    content <- msg[["content"]]
+    role <- msg[["role"]] %||% role
+  }
+
+  is_block <- inherits(content, "shinychat_block")
+  is_mixed_list <- is.list(content) &&
+    !is_block &&
+    !inherits(content, c("shiny.tag", "shiny.tag.list", "html", "htmlwidget"))
+  is_non_string_html <- inherits(
+    content,
+    c("shiny.tag", "shiny.tag.list", "htmlwidget")
+  )
+  is_string_html <- is.character(content) && inherits(content, "html")
+
+  if (is_block || is_mixed_list || is_non_string_html || is_string_html) {
+    if (is_non_string_html || is_string_html) {
+      segments_result <- build_html_island_segments_static(content)
+    } else {
+      segments_result <- build_wire_segments_static(content)
+    }
+    wire_segments <- segments_result$segments
+    all_deps <- segments_result$deps
+  } else {
+    # Plain character content (markdown string).
+    wire_segments <- list(list(
+      content = paste(content, collapse = "\n"),
+      content_type = "markdown"
+    ))
+    all_deps <- list()
+  }
+
+  # Strip html_deps from every block segment so they don't enter the JSON.
+  # Raw dep objects are collected separately and attached to the container.
+  segments <- lapply(wire_segments, function(seg) {
+    if ("type" %in% names(seg) && "html_deps" %in% names(seg)) {
+      seg[names(seg) != "html_deps"]
+    } else {
+      seg
+    }
+  })
+
+  entry <- list(role = role, segments = segments)
+  # Mirror the static tag path: the assistant-icon default must not leak onto
+  # user messages.
+  if (!identical(role, "user") && !is.null(icon_attr)) {
+    entry$icon <- icon_attr
+  }
+  # Attachments (when present on the message list form)
+  if (
+    is.list(msg) &&
+      !is.null(msg[["attachments"]]) &&
+      length(msg$attachments) > 0
+  ) {
+    entry$attachments <- msg$attachments
+  }
+
+  list(entry = entry, deps = all_deps)
+}
+
+#' Low-level function to append a message to a chat control
+#'
+#' For advanced users who want to control the message chunking behavior. Most
+#' users should use [chat_append()] instead.
+#'
+#' @param id The ID of the chat element
+#' @param msg The message to append. Should be a named list with `role` and
+#'   `content` fields. The `role` field should be either "user" or "assistant".
+#'   The `content` field should be a string containing the message content, in
+#'   Markdown format.
+#' @param chunk Whether `msg` is just a chunk of a message, and if so, what
+#'   type. If `FALSE`, then `msg` is a complete message. If `"start"`, then
+#'   `msg` is the first chunk of a multi-chunk message. If `"end"`, then `msg`
+#'   is the last chunk of a multi-chunk message. If `TRUE`, then `msg` is an
+#'   intermediate chunk of a multi-chunk message. Default is `FALSE`.
+#' @param operation The operation to perform on the message. If `"append"`,
+#'   then the new content is appended to the existing message content. If
+#'   `"replace"`, then the existing message content is replaced by the new
+#'   content. Ignored if `chunk` is `FALSE`.
+#' @param icon An optional icon to display next to the message, currently only
+#'   used for assistant messages. The icon can be any HTML element (e.g.,
+#'   [htmltools::img()] tag) or a string of HTML. Pass `FALSE` to remove the
+#'   icon for this message, or `TRUE` to use the default icon.
+#' @param session The Shiny session object
+#'
+#' @returns Returns nothing (\code{invisible(NULL)}).
+#'
+#' @importFrom shiny getDefaultReactiveDomain
+#'
+#' @examplesIf interactive()
+#' library(shiny)
+#' library(coro)
+#' library(bslib)
+#' library(shinychat)
+#'
+#' # Dumbest chatbot in the world: ignores user input and chooses
+#' # a random, vague response.
+#' fake_chatbot <- async_generator(function(id, input) {
+#'   responses <- c(
+#'     "What does that suggest to you?",
+#'     "I see.",
+#'     "I'm not sure I understand you fully.",
+#'     "What do you think?",
+#'     "Can you elaborate on that?",
+#'     "Interesting question! Let's examine thi... **See more**"
+#'   )
+#'
+#'   # Use low-level chat_append_message() to temporarily set a progress message
+#'   chat_append_message(id, list(role = "assistant", content = "_Thinking..._ "))
+#'   await(async_sleep(1))
+#'   # Clear the progress message
+#'   chat_append_message(id, list(role = "assistant", content = ""), operation = "replace")
+#'
+#'   for (chunk in strsplit(sample(responses, 1), "")[[1]]) {
+#'     yield(chunk)
+#'     await(async_sleep(0.02))
+#'   }
+#' })
+#'
+#' ui <- page_fillable(
+#'   chat_ui("chat", fill = TRUE)
+#' )
+#'
+#' server <- function(input, output, session) {
+#'   observeEvent(input$chat_user_input, {
+#'     response <- fake_chatbot("chat", input$chat_user_input)
+#'     chat_append("chat", response)
+#'   })
+#' }
+#'
+#' shinyApp(ui, server)
+#'
+#' @export
+chat_append_message <- function(
+  id,
+  msg,
+  chunk = TRUE,
+  operation = c("append", "replace"),
+  icon = NULL,
+  session = getDefaultReactiveDomain()
+) {
+  check_active_session(session)
+
+  if (!is.list(msg)) {
+    rlang::abort("`msg` must be a named list with 'role' and 'content' fields")
+  }
+  if (!isTRUE(msg[["role"]] %in% c("user", "assistant"))) {
+    warning("Invalid role argument; must be 'user' or 'assistant'")
+    return(invisible(NULL))
+  }
+
+  if (!isFALSE(chunk)) {
+    if (chunk == "start") {
+      chunk_type <- "start"
+    } else if (chunk == "end") {
+      chunk_type <- "end"
+    } else if (isTRUE(chunk)) {
+      chunk_type <- "intermediate"
+    } else {
+      rlang::abort("Invalid chunk argument")
+    }
+  } else {
+    chunk_type <- "complete"
+  }
+
+  content <- msg[["content"]]
+  is_thinking <- inherits(content, "shinychat_thinking")
+  if (is_thinking) {
+    content <- unclass(content)
+  }
+
+  is_block <- inherits(content, "shinychat_block")
+  is_mixed_list <- is.list(content) &&
+    !is_block &&
+    !inherits(content, c("shiny.tag", "shiny.tag.list", "html", "htmlwidget"))
+
+  # Non-string HTML content (tag/tag.list/htmlwidget) and string-typed HTML
+  # (htmltools::HTML()) both go through the html_block island-splitting path.
+  # Mirrors Python's ChatMessage.__init__, where HTML is not a str subclass
+  # and so takes the non-string (island) branch.
+  is_non_string_html <- inherits(
+    content,
+    c("shiny.tag", "shiny.tag.list", "htmlwidget")
+  )
+  is_string_html <- is.character(content) && inherits(content, "html")
+  is_html <- is_non_string_html || is_string_html
+  content_type <- if (is_thinking) {
+    "thinking"
+  } else if (is_html) {
+    "html"
+  } else {
+    "markdown"
+  }
+
+  operation <- match.arg(operation)
+
+  icon_str <- resolve_icon_attr(icon)
+
+  if (is_block || is_mixed_list || is_html) {
+    # Build wire segments from the block(s), mixed list, or HTML content
+    # (split into html_block islands + bare React string parts).
+    # Block deps are session-processed and attached to the block's
+    # html_deps field; all block deps are also collected for the envelope.
+    if (is_html) {
+      segments_result <- build_html_island_segments(content, session)
+    } else {
+      segments_result <- build_wire_segments(content, session)
+    }
+    wire_segments <- segments_result$segments
+    all_block_deps <- segments_result$deps
+
+    if (chunk_type == "start") {
+      # chunk_start carries the full message payload with inline segments
+      message_payload <- list(
+        role = msg[["role"]],
+        segments = wire_segments
+      )
+      if (!is.null(icon_str)) {
+        message_payload$icon <- icon_str
+      }
+      action <- list(type = "chunk_start", message = message_payload)
+      send_chat_action(
+        id,
+        action = action,
+        html_deps = all_block_deps,
+        session = session
+      )
+    } else if (chunk_type == "end") {
+      # Emit any remaining segments as chunk/block_insert, then chunk_end
+      send_wire_segment_actions(
+        id,
+        wire_segments,
+        operation = operation,
+        html_deps = all_block_deps,
+        session = session
+      )
+      send_chat_action(id, action = list(type = "chunk_end"), session = session)
+    } else if (chunk_type == "intermediate") {
+      # A single block or mixed list arriving mid-stream: emit each segment
+      # in order (chunk for strings, block_insert for blocks).
+      send_wire_segment_actions(
+        id,
+        wire_segments,
+        operation = operation,
+        html_deps = all_block_deps,
+        session = session
+      )
+    } else {
+      # chunk_type == "complete": message action with inline mixed segments
+      message_payload <- list(
+        role = msg[["role"]],
+        segments = wire_segments
+      )
+      if (!is.null(icon_str)) {
+        message_payload$icon <- icon_str
+      }
+      action <- list(type = "message", message = message_payload)
+      send_chat_action(
+        id,
+        action = action,
+        html_deps = all_block_deps,
+        session = session
+      )
+    }
+
+    invisible(NULL)
+    return(invisible(NULL))
+  }
+
+  if (is.character(content)) {
+    # content is most likely a string, so avoid overhead in that case.
+    # (HTML()-marked strings were already handled above via
+    # build_html_island_segments, so the remaining character content is
+    # plain markdown/thinking text.)
+    ui <- list(html = content, deps = NULL)
+  } else {
+    # Fallback for exotic non-character content that is neither a block, a
+    # mixed list, nor HTML (everything documented is handled above).
+    ui <- process_ui(htmltools::as.tags(content), session)
+  }
+
+  msg_content <- ui[["html"]]
+
+  html_deps <- ui[["deps"]]
+
+  if (chunk_type == "start") {
+    message_payload <- list(
+      role = msg[["role"]],
+      segments = list(list(content = msg_content, content_type = content_type))
+    )
+    if (!is.null(icon_str)) {
+      message_payload$icon <- icon_str
+    }
+    action <- list(type = "chunk_start", message = message_payload)
+    send_chat_action(
+      id,
+      action = action,
+      html_deps = html_deps,
+      session = session
+    )
+  } else if (chunk_type == "end") {
+    if (nzchar(msg_content)) {
+      chunk_action <- list(
+        type = "chunk",
+        content = msg_content,
+        operation = operation,
+        content_type = content_type
+      )
+      send_chat_action(
+        id,
+        action = chunk_action,
+        html_deps = html_deps,
+        session = session
+      )
+    }
+    send_chat_action(id, action = list(type = "chunk_end"), session = session)
+  } else if (chunk_type == "intermediate") {
+    action <- list(
+      type = "chunk",
+      content = msg_content,
+      operation = operation,
+      content_type = content_type
+    )
+    send_chat_action(
+      id,
+      action = action,
+      html_deps = html_deps,
+      session = session
+    )
+  } else {
+    # chunk_type == "complete"
+    message_payload <- list(
+      role = msg[["role"]],
+      segments = list(list(content = msg_content, content_type = content_type))
+    )
+    if (!is.null(icon_str)) {
+      message_payload$icon <- icon_str
+    }
+    action <- list(type = "message", message = message_payload)
+    send_chat_action(
+      id,
+      action = action,
+      html_deps = html_deps,
+      session = session
+    )
+  }
+
+  invisible(NULL)
+}
+
+restore_history_message <- function(chat_id, message, session) {
+  # Stored segments are already interleaved: each entry is either a string
+  # segment (content/content_type) or a structured block (distinguished by
+  # a `type` field). Project to the wire format by passing blocks through
+  # unchanged and keeping only content/content_type on string segments.
+  # Mirrors Python's StoredMessage.wire_segments().
+  wire_segments <- lapply(message$segments, function(seg) {
+    if ("type" %in% names(seg)) {
+      seg
+    } else {
+      list(content = seg$content, content_type = seg$content_type)
+    }
+  })
+
+  message_payload <- list(
+    role = message$role,
+    segments = wire_segments
+  )
+  if (!is.null(message$attachments) && length(message$attachments) > 0) {
+    message_payload$attachments <- message$attachments
+  }
+  action <- list(type = "message", message = message_payload)
+  send_chat_action(
+    chat_id,
+    action = action,
+    html_deps = message$htmlDeps,
+    session = session
+  )
+}
+
+chat_append_stream <- function(
+  id,
+  stream,
+  role = "assistant",
+  icon = NULL,
+  session = getDefaultReactiveDomain()
+) {
+  # `chat_append_stream_impl()` is a coroutine, so everything ahead of its
+  # first `await` runs eagerly. A stream that fails before it yields anything
+  # therefore throws synchronously rather than rejecting, and would skip the
+  # handling below entirely. `ellmer::Chat$stream_async()` returns a
+  # synchronous generator that performs the request on its first advance, so
+  # this is the shape of every turn a provider rejects outright.
+  result <- tryCatch(
+    chat_append_stream_impl(id, stream, role, icon, session),
+    error = function(cnd) promises::promise_reject(cnd)
+  )
+  result <- chat_update_bookmark(id, result, session = session)
+  result <- chat_history_on_response(id, result, session = session)
+  # Handle erroneous result...
+  result <- promises::catch(result, function(reason) {
+    # ...but rethrow the error as a silent error, so the caller can also handle
+    # it if they want, but it won't bring down the app.
+    class(reason) <- c("shiny.silent.error", class(reason))
+    cnd_signal(reason)
+  })
+
+  promises::catch(result, function(reason) {
+    chat_append_message(
+      id,
+      list(
+        role = role,
+        content = sanitized_chat_error(reason)
+      ),
+      chunk = "end",
+      operation = "append",
+      session = session
+    )
+    rlang::warn(
+      sprintf(
+        "ERROR: An error occurred in `chat_append_stream(id=\"%s\")`",
+        session$ns(id)
+      ),
+      parent = reason
+    )
+  })
+
+  # Note that we're not returning the result of `promises::catch()`, because we
+  # want to return a rejected promise so the caller can see the error. But we
+  # use the `catch()` both to make the error visible to the user *and* to ensure
+  # there's no "unhandled promise error" warning if the caller chooses not to do
+  # anything with it.
+  result
+}
+
+utils::globalVariables(c("generator_env", "exits", "yield"))
+
+chat_append_stream_impl <- NULL
+rlang::on_load(
+  chat_append_stream_impl <- coro::async(function(
+    id,
+    stream,
+    role = "assistant",
+    icon = NULL,
+    session = shiny::getDefaultReactiveDomain()
+  ) {
+    chat_append_ <- function(content, chunk = TRUE, ...) {
+      chat_append_message(
+        id,
+        msg = list(role = role, content = content),
+        operation = "append",
+        chunk = chunk,
+        session = session,
+        ...
+      )
+    }
+
+    chat_append_("", chunk = "start", icon = icon)
+
+    res <- fastmap::fastqueue(200)
+
+    for (msg in stream) {
+      if (promises::is.promising(msg)) {
+        msg <- await(msg)
+      }
+      if (coro::is_exhausted(msg)) {
+        break
+      }
+
+      res$add(msg)
+
+      msg <- contents_shinychat_wrapped(msg)
+
+      chat_append_(msg)
+    }
+
+    chat_append_("", chunk = "end")
+
+    res <- res$as_list()
+    if (every(res, is.character)) {
+      paste(unlist(res), collapse = "")
+    } else {
+      res
+    }
+  })
+)
+
+#' Get the current greeting content
+#'
+#' @param id The ID of the chat element
+#' @param session The Shiny session object
+#'
+#' @return A character string with the current greeting content, or `NULL` if
+#'   no greeting is set or has been cleared.
+#'
+#' @export
+chat_get_greeting <- function(id, session = getDefaultReactiveDomain()) {
+  g <- get_session_greeting_state(session, id)
+  g$content
+}
+
+#' Set the greeting for a chat UI
+#'
+#' @description
+#' Sets or clears the greeting displayed in an existing [chat_ui()]. The
+#' greeting is shown when the chat first loads and is dismissed when the user
+#' sends their first message.
+#'
+#' Call `chat_set_greeting()` from the server to display a dynamic or streaming
+#' greeting. This is typically used inside an [shiny::observeEvent()] watching
+#' `input$<id>_greeting_requested` -- an event that fires when the chat is
+#' visible, has no messages, and has no greeting set. See the **Greeting**
+#' section in [chat_ui()] for details on `greeting_requested`.
+#'
+#' If the greeting has already been dismissed, calling this function updates
+#' the greeting content but does not make it visible again. To show a new
+#' greeting after dismissal, first clear the chat with
+#' `chat_clear(id, greeting = TRUE)`.
+#'
+#' Pass `NULL` to clear the current greeting entirely.
+#'
+#' @param id The ID of the chat element
+#' @param greeting The greeting to display. Can be:
+#'   * `NULL` to clear the current greeting.
+#'   * A plain string or [htmltools::HTML()] object (auto-wrapped with default
+#'     options).
+#'   * A [chat_greeting()] object.
+#' @param session The Shiny session object
+#'
+#' @returns Returns `invisible(NULL)` for static and NULL greetings, or a
+#'   promise for streaming greetings (resolves when streaming is complete).
+#'
+#' @examplesIf interactive()
+#' library(shiny)
+#' library(bslib)
+#' library(shinychat)
+#'
+#' # Static greeting set from the server
+#' ui <- page_fillable(chat_ui("chat"))
+#'
+#' server <- function(input, output, session) {
+#'   chat_set_greeting("chat", "## Welcome!\n\nHow can I help you today?")
+#'
+#'   observeEvent(input$chat_user_input, {
+#'     chat_append("chat", paste0("You said: ", input$chat_user_input))
+#'   })
+#' }
+#'
+#' shinyApp(ui, server)
+#'
+#' @examplesIf interactive()
+#' library(shiny)
+#' library(bslib)
+#' library(shinychat)
+#' library(coro)
+#'
+#' # Streaming greeting generated by a function
+#' greeting_generator <- async_generator(function() {
+#'   for (chunk in strsplit("## Hello!\n\nHow can I help you?", "")[[1]]) {
+#'     yield(chunk)
+#'     await(async_sleep(0.02))
+#'   }
+#' })
+#'
+#' ui <- page_fillable(chat_ui("chat"))
+#'
+#' server <- function(input, output, session) {
+#'   chat_set_greeting("chat", chat_greeting(greeting_generator()))
+#'
+#'   observeEvent(input$chat_user_input, {
+#'     chat_append("chat", paste0("You said: ", input$chat_user_input))
+#'   })
+#' }
+#'
+#' shinyApp(ui, server)
+#'
+#' @examplesIf interactive()
+#' library(shiny)
+#' library(bslib)
+#' library(shinychat)
+#'
+#' # LLM-generated greeting using greeting_requested
+#' ui <- page_fillable(chat_ui("chat"))
+#'
+#' server <- function(input, output, session) {
+#'   chat_client <- ellmer::chat_openai(model = "gpt-4o")
+#'
+#'   observeEvent(input$chat_greeting_requested, {
+#'     stream <- chat_client$stream_async(
+#'       "Generate a short, friendly welcome message."
+#'     )
+#'     chat_set_greeting("chat", chat_greeting(stream))
+#'   })
+#'
+#'   observeEvent(input$chat_user_input, {
+#'     stream <- chat_client$stream_async(input$chat_user_input)
+#'     chat_append("chat", stream)
+#'   })
+#' }
+#'
+#' shinyApp(ui, server)
+#'
+#' @examplesIf interactive()
+#' library(shiny)
+#' library(bslib)
+#' library(shinychat)
+#'
+#' # Regenerate pattern: chat_clear(greeting = TRUE) triggers greeting_requested
+#' ui <- page_fillable(
+#'   chat_ui("chat"),
+#'   actionButton("regenerate", "New greeting")
+#' )
+#'
+#' server <- function(input, output, session) {
+#'   observeEvent(input$chat_greeting_requested, {
+#'     chat_set_greeting(
+#'       "chat",
+#'       paste("## Welcome!\n\nGenerated at", Sys.time())
+#'     )
+#'   })
+#'
+#'   observeEvent(input$regenerate, {
+#'     chat_clear("chat", greeting = TRUE)
+#'   })
+#'
+#'   observeEvent(input$chat_user_input, {
+#'     chat_append("chat", paste0("You said: ", input$chat_user_input))
+#'   })
+#' }
+#'
+#' shinyApp(ui, server)
+#'
+#' @export
+chat_set_greeting <- function(
+  id,
+  greeting,
+  session = getDefaultReactiveDomain()
+) {
+  check_active_session(session)
+
+  if (is.null(greeting)) {
+    send_chat_action(
+      id,
+      action = list(type = "greeting_clear"),
+      session = session
+    )
+    set_session_greeting_state(session, id, value = NULL)
+    return(invisible(NULL))
+  }
+
+  if (!inherits(greeting, "chat_greeting")) {
+    greeting <- chat_greeting(greeting)
+  }
+
+  content <- greeting$content
+  options <- list(persistent = isTRUE(greeting$persistent))
+
+  if (
+    inherits(content, "coro_generator_instance") ||
+      promises::is.promising(content)
+  ) {
+    stream <- as_generator(content)
+    result <- chat_set_greeting_stream(id, stream, options, session)
+    result <- promises::then(result, function(streamed_content) {
+      set_session_greeting_state(
+        session,
+        id,
+        value = list(content = streamed_content)
+      )
+    })
+    result <- promises::catch(result, function(reason) {
+      class(reason) <- c("shiny.silent.error", class(reason))
+      cnd_signal(reason)
+    })
+    promises::catch(result, function(reason) {
+      send_chat_action(
+        id,
+        action = list(type = "greeting_end"),
+        session = session
+      )
+      rlang::warn(
+        sprintf(
+          "ERROR: An error occurred in `chat_set_greeting(id=\"%s\")`",
+          session$ns(id)
+        ),
+        parent = reason
+      )
+    })
+    return(result)
+  }
+
+  if (is.function(content)) {
+    cli::cli_abort(
+      c(
+        "{.fn chat_set_greeting} does not accept a function as greeting content.",
+        "i" = "Pass the {.emph result} of calling your function, not the function itself.",
+        "i" = "To use a greeting function with automatic lifecycle management, pass it to the {.arg greeting} argument of {.fn chat_server}."
+      )
+    )
+  }
+
+  if (is.character(content) && !inherits(content, "html")) {
+    greeting_content <- content
+    greeting_content_type <- "markdown"
+    html_deps <- NULL
+  } else if (
+    inherits(content, "html") &&
+      !inherits(content, c("shiny.tag", "shiny.tag.list"))
+  ) {
+    greeting_content <- as.character(content)
+    greeting_content_type <- "html"
+    html_deps <- NULL
+  } else {
+    # tag/tagList content: the greeting wire payload is a single string (it
+    # cannot carry structured blocks), so trusted content renders via the
+    # shared island derivation concatenated into one HTML string.
+    rendered <- render_island_string(content)
+    greeting_content <- rendered$html
+    greeting_content_type <- "html"
+    html_deps <- serialize_html_deps(rendered$deps, session)
+  }
+
+  action <- list(
+    type = "greeting",
+    content = greeting_content,
+    content_type = greeting_content_type,
+    options = options
+  )
+  send_chat_action(
+    id,
+    action = action,
+    html_deps = html_deps,
+    session = session
+  )
+  set_session_greeting_state(
+    session,
+    id,
+    value = list(content = greeting_content)
+  )
+  invisible(NULL)
+}
+
+chat_set_greeting_stream <- NULL
+rlang::on_load(
+  chat_set_greeting_stream <- coro::async(function(
+    id,
+    stream,
+    options,
+    session = shiny::getDefaultReactiveDomain()
+  ) {
+    send_greeting_action <- function(action) {
+      send_chat_action(id, action = action, session = session)
+    }
+
+    send_greeting_action(
+      list(
+        type = "greeting_start",
+        content = "",
+        content_type = "markdown",
+        options = options
+      )
+    )
+
+    chunks <- character(0)
+    for (msg in stream) {
+      if (promises::is.promising(msg)) {
+        msg <- await(msg)
+      }
+      if (coro::is_exhausted(msg)) {
+        break
+      }
+
+      if (is.character(msg) && !inherits(msg, "html")) {
+        chunk_html <- msg
+        chunk_deps <- NULL
+        chunk_content_type <- "markdown"
+      } else {
+        # Trusted content (HTML()/tags): render via the shared island
+        # derivation into a single HTML string — the greeting_chunk wire
+        # payload is a string and cannot carry structured blocks.
+        rendered <- render_island_string(msg)
+        chunk_html <- rendered$html
+        chunk_deps <- serialize_html_deps(rendered$deps, session)
+        chunk_content_type <- "html"
+      }
+
+      chunks <- c(chunks, chunk_html)
+      send_chat_action(
+        id,
+        action = list(
+          type = "greeting_chunk",
+          content = chunk_html,
+          operation = "append",
+          content_type = chunk_content_type
+        ),
+        html_deps = chunk_deps,
+        session = session
+      )
+    }
+
+    send_greeting_action(list(type = "greeting_end"))
+    paste(chunks, collapse = "")
+  })
+)
+
+#' Clear all messages from a chat control
+#'
+#' @description
+#' Removes all messages from the chat UI. Set `greeting = TRUE` to also
+#' clear the greeting, which re-triggers `greeting_requested` (see the
+#' **Greeting** section in [chat_ui()]).
+#'
+#' This is a UI-level primitive: it does not clear an ellmer client's turns or
+#' reset conversation history managed by [chat_server()]. For a full reset of a
+#' managed chat, call the `new_chat()` method on the value returned by
+#' [chat_server()].
+#'
+#' @param id The ID of the chat element
+#' @param greeting If `TRUE`, also clears the greeting. When the greeting is
+#'   cleared, `greeting_requested` will fire again (if the chat is visible),
+#'   allowing the server to generate a new greeting.
+#' @param session The Shiny session object
+#'
+#' @export
+#' @examplesIf interactive()
+#'
+#' library(shiny)
+#' library(bslib)
+#'
+#' ui <- page_fillable(
+#'   chat_ui("chat", fill = TRUE),
+#'   actionButton("clear", "Clear chat")
+#' )
+#'
+#' server <- function(input, output, session) {
+#'   observeEvent(input$clear, {
+#'     chat_clear("chat")
+#'   })
+#'
+#'   observeEvent(input$chat_user_input, {
+#'     response <- paste0("You said: ", input$chat_user_input)
+#'     chat_append("chat", response)
+#'   })
+#' }
+#'
+#' shinyApp(ui, server)
+#'
+#' @examplesIf interactive()
+#'
+#' library(shiny)
+#' library(bslib)
+#' library(shinychat)
+#'
+#' # Regenerate greeting on clear
+#' ui <- page_fillable(
+#'   chat_ui("chat"),
+#'   actionButton("new_chat", "New chat")
+#' )
+#'
+#' server <- function(input, output, session) {
+#'   observeEvent(input$chat_greeting_requested, {
+#'     chat_set_greeting("chat", "## Welcome!\n\nHow can I help?")
+#'   })
+#'
+#'   observeEvent(input$new_chat, {
+#'     # Clearing with greeting = TRUE triggers greeting_requested again
+#'     chat_clear("chat", greeting = TRUE)
+#'   })
+#'
+#'   observeEvent(input$chat_user_input, {
+#'     chat_append("chat", paste0("You said: ", input$chat_user_input))
+#'   })
+#' }
+#'
+#' shinyApp(ui, server)
+chat_clear <- function(
+  id,
+  greeting = FALSE,
+  session = getDefaultReactiveDomain()
+) {
+  check_active_session(session)
+  action <- list(type = "clear")
+  if (isTRUE(greeting)) {
+    action$greeting <- TRUE
+    set_session_greeting_state(session, id, value = NULL)
+  }
+  send_chat_action(id, action = action, session = session)
+}
+
+#' Update the user input of a chat control
+#'
+#' @param id The ID of the chat element
+#' @param ... Currently unused, but reserved for future use.
+#' @param value The value to set the user input to. If `NULL`, the input will not be updated.
+#' @param placeholder The placeholder text for the user input
+#' @param submit Whether to automatically submit the text for the user. Requires `value`.
+#' @param focus Whether to move focus to the input element. Requires `value`
+#'   or non-empty `attachments`.
+#' @param attachments A list of attachment objects created by
+#'   [chat_attachment()]. When `NULL` (default), any existing staged
+#'   attachments are left unchanged. Pass an empty list (`list()`) to clear
+#'   staged attachments.
+#' @param attachment_mode How to combine `attachments` with any already-staged
+#'   attachments. `"append"` (default) adds to the existing set; `"set"`
+#'   replaces it. Use `attachment_mode = "set"` with `attachments = list()` to
+#'   clear all staged attachments.
+#' @param session The Shiny session object
+#'
+#' @export
+#' @examplesIf interactive()
+#' library(shiny)
+#' library(bslib)
+#' library(shinychat)
+#'
+#' ui <- page_fillable(
+#'   chat_ui("chat"),
+#'   layout_columns(
+#'     fill = FALSE,
+#'     actionButton("update_placeholder", "Update placeholder"),
+#'     actionButton("update_value", "Update user input")
+#'   )
+#' )
+#'
+#' server <- function(input, output, session) {
+#'   observeEvent(input$update_placeholder, {
+#'     update_chat_user_input("chat", placeholder = "New placeholder text")
+#'   })
+#'
+#'   observeEvent(input$update_value, {
+#'     update_chat_user_input("chat", value = "New user input", focus = TRUE)
+#'   })
+#'
+#'   observeEvent(input$chat_user_input, {
+#'     response <- paste0("You said: ", input$chat_user_input)
+#'     chat_append("chat", response)
+#'   })
+#' }
+#'
+#' shinyApp(ui, server)
+
+update_chat_user_input <- function(
+  id,
+  ...,
+  value = NULL,
+  placeholder = NULL,
+  submit = FALSE,
+  focus = FALSE,
+  attachments = NULL,
+  attachment_mode = c("append", "set"),
+  session = getDefaultReactiveDomain()
+) {
+  rlang::check_dots_empty()
+
+  attachment_mode <- rlang::arg_match(attachment_mode)
+
+  if (isTRUE(submit) && is.null(value)) {
+    rlang::abort("An input `value` must be provided when `submit = TRUE`.")
+  }
+  if (isTRUE(focus) && is.null(value) && length(attachments) == 0) {
+    rlang::abort(
+      "An input `value` or `attachments` must be provided when `focus = TRUE`."
+    )
+  }
+
+  check_active_session(session)
+
+  vals <- drop_nulls(
+    list(
+      value = value,
+      placeholder = placeholder,
+      submit = if (submit) TRUE else NULL,
+      focus = if (focus) TRUE else NULL,
+      attachments = attachments,
+      attachment_mode = if (
+        !is.null(attachments) && attachment_mode != "append"
+      ) {
+        attachment_mode
+      } else {
+        NULL
+      }
+    )
+  )
+
+  action <- c(list(type = "update_input"), vals)
+
+  send_chat_action(id, action = action, session = session)
+}
