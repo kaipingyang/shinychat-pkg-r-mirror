@@ -2,11 +2,17 @@
 
 ## New features and improvements
 
+* `chat_server()` now exposes the active conversation's title as `chat$history$title()`, a reactive that mirrors `chat$history$conversation_id()`. It is `NULL` until the first response is saved, then follows the stored title across automatic titling, renames, restores, and conversation switches. (#471)
+
+* Tool call results that render HTML now syntax-highlight code blocks, matching how code looks elsewhere in the chat. (#455)
+
 * Text file attachments are now sent to the model via `ellmer::content_document_url()` rather than a hand-assembled `<file-attachment>` text wrapper, so providers that handle documents natively receive a real document. This raises the minimum required ellmer version to 0.5.0. (#415)
 
 * Streamed responses now reveal smoothly at a typing-like pace instead of in abrupt server-sized chunks, with far fewer re-renders along the way. Bursts of text catch up quickly, the reveal never flashes a partial HTML tag, and stopping a response reveals any buffered text immediately. The trailing dot now appears only once a stream has stalled (or before any text has arrived), rather than hopping along with every update. (#411)
 
 ## Bug fixes
+
+* A multi-call tool group now keeps the tool's definition title after its calls finish, instead of switching to the first call's result title. (#457)
 
 * Expanding a running tool call's row in a tool group now shows its arguments. Previously the panel stayed empty until the call finished. (#424)
 

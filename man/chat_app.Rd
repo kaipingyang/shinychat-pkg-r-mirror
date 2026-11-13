@@ -134,6 +134,17 @@ restores, conversation switches, and \code{set_client()} calls. The ID
 is also handed to the client (via its \code{conversation_id} binding,
 when supported), which records it as the \code{gen_ai.conversation.id}
 attribute on its own OpenTelemetry spans.
+\item \code{history$title()}: A reactive expression returning the active
+conversation's title, mirroring \code{history$conversation_id()}: \code{NULL}
+when history is disabled, the chat is an empty draft, or the
+conversation has an ID but hasn't been saved yet. After the first
+response is saved it is the fallback title derived from the first
+user message, even with \code{history_options(title = NULL)}; it then
+updates when the active conversation is renamed or automatically
+retitled, and follows restores, conversation switches, and
+\code{set_client()} calls. It is \code{NULL} again after a new chat or after
+deleting the active conversation. Like any reactive, it requires a
+reactive context; use \code{\link[shiny:isolate]{shiny::isolate()}} outside one.
 \item \code{set_client(new_client, sync = TRUE)}: Replace the chat client used by
 the module. When \code{sync} is \code{TRUE} (the default), the new client
 inherits conversation turns, system prompt, and tools from the previous
@@ -249,7 +260,7 @@ ui <- page_fillable(
       card_header("Chat with Claude"),
       chat_ui(
         "claude",
-        greeting = "Hi! Use this chat interface to chat with Anthropic's `claude-3-5-sonnet`."
+        greeting = "Hi! Use this chat interface to chat with Anthropic's `claude-sonnet-5-5`."
       )
     ),
     card(
@@ -263,7 +274,7 @@ ui <- page_fillable(
 )
 
 server <- function(input, output, session) {
-  claude <- ellmer::chat_anthropic(model = "claude-3-5-sonnet-latest") # Requires ANTHROPIC_API_KEY
+  claude <- ellmer::chat_anthropic(model = "claude-sonnet-5-5") # Requires ANTHROPIC_API_KEY
   openai <- ellmer::chat_openai(model = "gpt-4o") # Requires OPENAI_API_KEY
 
   chat_server("claude", claude)
